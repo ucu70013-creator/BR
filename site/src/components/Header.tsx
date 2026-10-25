@@ -3,7 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { themes } from '../themes';
 import { useLang } from '../App';
 
-const BOT_URL = 'https://t.me/Brrown_V2bot';
+const BOT_URL = 'https://t.me/Brown_V2';
 
 const NAV_RU = [
   { path: '/', label: 'Главная' },

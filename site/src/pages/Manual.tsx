@@ -10,6 +10,7 @@ interface Method {
   steps: string[];
   extra?: string;
   reasons?: string[];
+  premium?: boolean;
 }
 
 const METHODS_RU: Method[] = [
@@ -27,14 +28,15 @@ const METHODS_RU: Method[] = [
   {
     icon: '👑',
     name: 'Премиальная Отправка',
-    desc: 'То же самое что обычная, но через пул премиум-аккаунтов Telegram. Более высокая доходимость жалоб.',
+    desc: 'То же самое что обычная, но через пул Premium-аккаунтов Telegram. В 2–3x выше доходимость жалоб.',
     cd: '30 минут',
     steps: [
       'Нажать 👑 Премиальная Отправка',
       'Подтвердить мануал',
       'Ввести ссылку на цель',
     ],
-    extra: 'Требует активной подписки.',
+    extra: 'Эксклюзивный метод — доступен только с Премиум.',
+    premium: true,
   },
   {
     icon: '🌐',
@@ -120,6 +122,45 @@ const METHODS_RU: Method[] = [
       'Подтвердить или изменить текст жалобы',
     ],
     reasons: ['Child abuse', 'Violence', 'Illegal goods', 'Illegal adult content', 'Personal data', 'Terrorism', 'Scam or spam', 'Other'],
+  },
+  {
+    icon: '🌐',
+    name: 'Universal метод',
+    desc: 'Продвинутая универсальная атака — многовекторная отправка жалоб по нескольким каналам одновременно. Максимальное покрытие.',
+    cd: '1 час',
+    steps: [
+      'Нажать 🌐 Universal метод',
+      'Ввести ссылку на цель',
+      'Подтвердить запуск',
+    ],
+    extra: 'Эксклюзивный метод — доступен только с Премиум.',
+    premium: true,
+  },
+  {
+    icon: '💀',
+    name: 'Снос сессий',
+    desc: 'Принудительный сброс всех активных сессий цели. Цель вылетает из всех устройств.',
+    cd: '30 минут',
+    steps: [
+      'Нажать 💀 Снос сессий',
+      'Ввести ссылку на аккаунт цели',
+      'Подтвердить запуск',
+    ],
+    extra: 'Эксклюзивный метод — доступен только с Премиум.',
+    premium: true,
+  },
+  {
+    icon: '🌍',
+    name: 'Домен киллер',
+    desc: 'Блокировка доменов, связанных с целью. Отправляет жалобы регуляторам и хостинг-провайдерам.',
+    cd: '1 час',
+    steps: [
+      'Нажать 🌍 Домен киллер',
+      'Ввести домен цели',
+      'Подтвердить запуск',
+    ],
+    extra: 'Эксклюзивный метод — доступен только с Премиум.',
+    premium: true,
   },
   {
     icon: '📄',
@@ -242,14 +283,15 @@ const METHODS_EN: Method[] = [
   {
     icon: '👑',
     name: 'Premium Send',
-    desc: 'Same as regular, but through a pool of premium Telegram accounts. Higher report delivery rate.',
+    desc: 'Same as regular, but through a pool of Telegram Premium accounts. 2–3x higher report delivery rate.',
     cd: '30 minutes',
     steps: [
       'Tap 👑 Premium Send',
       'Confirm the manual',
       'Enter the target link',
     ],
-    extra: 'Requires an active subscription.',
+    extra: 'Exclusive method — available with Premium only.',
+    premium: true,
   },
   {
     icon: '🌐',
@@ -303,6 +345,45 @@ const METHODS_EN: Method[] = [
     cd: '1 hour',
     steps: ['Tap 🇪🇺 DSA Report', 'Enter target link', 'Select violation category', 'Select subcategory if applicable', 'Confirm or edit the complaint text'],
     reasons: ['Child abuse', 'Violence', 'Illegal goods', 'Illegal adult content', 'Personal data', 'Terrorism', 'Scam or spam', 'Other'],
+  },
+  {
+    icon: '🌐',
+    name: 'Universal Method',
+    desc: 'Advanced multi-vector attack — reports sent across multiple channels simultaneously for maximum coverage.',
+    cd: '1 hour',
+    steps: [
+      'Tap 🌐 Universal Method',
+      'Enter the target link',
+      'Confirm launch',
+    ],
+    extra: 'Exclusive method — available with Premium only.',
+    premium: true,
+  },
+  {
+    icon: '💀',
+    name: 'Session Knockdown',
+    desc: 'Force-logout all active sessions of the target. The target gets signed out from every device.',
+    cd: '30 minutes',
+    steps: [
+      'Tap 💀 Session Knockdown',
+      'Enter the target account link',
+      'Confirm launch',
+    ],
+    extra: 'Exclusive method — available with Premium only.',
+    premium: true,
+  },
+  {
+    icon: '🌍',
+    name: 'Domain Killer',
+    desc: "Block domains linked to the target. Files complaints with regulators and hosting providers.",
+    cd: '1 hour',
+    steps: [
+      'Tap 🌍 Domain Killer',
+      'Enter the target domain',
+      'Confirm launch',
+    ],
+    extra: 'Exclusive method — available with Premium only.',
+    premium: true,
   },
   {
     icon: '📄',
@@ -393,7 +474,7 @@ export default function Manual() {
   return (
     <div className="page-inner container">
       <div className="page-head">
-        <div className="sec-label">📖</div>
+        <div className="sec-label">МАНУАЛ</div>
         <h1>{lang === 'ru' ? 'Мануал — Brown V2' : 'Manual — Brown V2'}</h1>
         <p>{lang === 'ru' ? 'Подробное описание всех методов бота' : 'Detailed description of all bot methods'}</p>
       </div>
@@ -403,8 +484,11 @@ export default function Manual() {
           <div key={i} className={`acc-item${open === i ? ' open' : ''}`}>
             <button className="acc-head" onClick={() => setOpen(open === i ? null : i)}>
               <span className="acc-icon"><AccIcon emoji={m.icon} /></span>
-              <span className="acc-name">{m.name}</span>
-              <span className="acc-cd">КД: {m.cd}</span>
+              <span className="acc-name">
+                {m.name}
+                {m.premium && <span className="badge-premium">PREMIUM</span>}
+              </span>
+              <span className="acc-cd">{lang === 'ru' ? 'КД' : 'CD'}: {m.cd}</span>
               <svg className="acc-arrow" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M6 9l6 6 6-6"/></svg>
             </button>
             {open === i && (

@@ -9,7 +9,7 @@ from aiogram import Bot, types
 import config
 from config import bot_logs
 import keyboards
-from utils import now_msk
+from utils import now_msk, ProgressBar, esc_md
 
 reasons = [
     b'2',  # Child abuse
@@ -1076,7 +1076,7 @@ def format_log_line(session, message_url, status):
     now = now_msk().strftime("%H:%M:%S")
     return f"[{now}] {session}.session -> {message_url} - [{status}]"
 
-async def _report_one_session_prem(session, chat_username, message_id, message_url, whitelist, target_ref):
+async def _report_one_session_prem(session, chat_username, message_id, message_url, whitelist, target_ref, peer_ref):
     """Параллельная отправка жалобы от одной премиум-сессии."""
     random_api = random.choice(API)
     api_id, api_hash = random_api.split(":", 1)
@@ -1090,32 +1090,59 @@ async def _report_one_session_prem(session, chat_username, message_id, message_u
         system_version='4.16.30-vxCUSTOM'
     )
     try:
-        try:
-            await asyncio.wait_for(client.connect(), timeout=6)
-        except asyncio.TimeoutError:
-            print(f"[PREM] [{session}] ❌ ОШИБКА СОЕДИНЕНИЯ (timeout)", flush=True)
+        connected = False
+        for db_attempt in range(3):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=12)
+                connected = True
+                break
+            except (asyncio.TimeoutError, OSError):
+                if db_attempt == 2:
+                    print(f"[PREM] [{session}] ❌ ОШИБКА СОЕДИНЕНИЯ (timeout)", flush=True)
+                    return "ОШИБКА СОЕДИНЕНИЯ", None
+                await asyncio.sleep(1)
+            except Exception as e:
+                if "database is locked" in str(e) and db_attempt < 2:
+                    await asyncio.sleep(random.uniform(1, 2))
+                else:
+                    raise
+        if not connected:
             return "ОШИБКА СОЕДИНЕНИЯ", None
 
         if not await client.is_user_authorized():
             print(f"[PREM] [{session}] ❌ НЕВАЛИД (не авторизован)", flush=True)
             return "НЕВАЛИД", None
 
-        chat = await client.get_entity(chat_username)
+        try:
+            chat = await client.get_entity(chat_username)
+            if peer_ref[0] is None:
+                peer_ref[0] = chat.id
+        except Exception as e:
+            if peer_ref[0] is not None and "No user has" in str(e):
+                chat = await client.get_entity(peer_ref[0])
+            else:
+                raise
         print(f"[PREM] [{session}] ✅ Подключён, чат получен: {chat_username}", flush=True)
 
         if target_ref[0] is None:
             msg = await client.get_messages(chat, ids=message_id)
-            if msg.from_id is not None:
-                user_entity = await client.get_entity(msg.from_id)
-                target_ref[0] = msg.from_id.user_id if isinstance(msg.from_id, PeerUser) else "?"
-                target_ref[1] = user_entity.username or "Нет username"
-                print(f"[PREM] [{session}] 🎯 Таргет определён: ID={target_ref[0]}, @{target_ref[1]}", flush=True)
-                if target_ref[0] in whitelist:
-                    print(f"[PREM] [{session}] 🍕 WHITELIST — таргет в белом списке", flush=True)
-                    return "WHITELIST", None
+            if msg is not None and msg.from_id is not None:
+                try:
+                    user_entity = await client.get_entity(msg.from_id)
+                    target_ref[0] = msg.from_id.user_id if isinstance(msg.from_id, PeerUser) else "?"
+                    target_ref[1] = user_entity.username or "Нет username"
+                    print(f"[PREM] [{session}] 🎯 Таргет определён: ID={target_ref[0]}, *@{target_ref[1]}*", flush=True)
+                    if target_ref[0] in whitelist:
+                        print(f"[PREM] [{session}] 🍕 WHITELIST — таргет в белом списке", flush=True)
+                        return "WHITELIST", None
+                except Exception:
+                    target_ref[0] = "anon"
+                    target_ref[1] = "Анонимный"
             else:
-                print(f"[PREM] [{session}] ⚠️ NO_ID — не удалось получить from_id сообщения", flush=True)
-                return "NO_ID", None
+                # Анонимный пост или канальное сообщение — продолжаем репорт
+                target_ref[0] = "anon"
+                target_ref[1] = "Анонимный"
+                print(f"[PREM] [{session}] ⚠️ from_id=None (анонимный/канал) — продолжаем репорт", flush=True)
 
         # Получаем список причин от сервера динамически (3-шаговый флоу)
         try:
@@ -1164,7 +1191,7 @@ async def _report_one_session_prem(session, chat_username, message_id, message_u
             await client.disconnect()
 
 
-async def main2(chat_username, message_id, user, username, message_url):
+async def main2(chat_username, message_id, user, username, message_url, _log_user=None, silent: bool = False):
     # Получаем вайтлист из PostgreSQL (db.py)
     try:
         import db as db_module
@@ -1178,32 +1205,39 @@ async def main2(chat_username, message_id, user, username, message_url):
 
     print(f"\n{'='*50}", flush=True)
     print(f"[PREM] 🚀 Запуск премиум-ботнета", flush=True)
-    print(f"[PREM] 👤 Пользователь: {user} (@{username})", flush=True)
+    print(f"[PREM] 👤 Пользователь: {user} (*@{username}*)", flush=True)
     print(f"[PREM] 🔗 Ссылка: {message_url}", flush=True)
     _sessions = _get_sessions()
     print(f"[PREM] 📦 Сессий загружено: {len(_sessions)}", flush=True)
     print(f"{'='*50}", flush=True)
 
     target_ref = [None, "Неизвестный пользователь"]
+    peer_ref = [None]
 
     # Запускаем сессии пачками по 8 с задержкой 3-5 сек между пачками
     BATCH_SIZE = 8
     results = []
+    pb = ProgressBar(bot, user, total=len(_sessions), title="👑 *Ботнет Премиум*", silent=silent)
+    await pb.start()
+    done_count = 0
     for i in range(0, len(_sessions), BATCH_SIZE):
         batch = _sessions[i:i + BATCH_SIZE]
-        batch_tasks = [_report_one_session_prem(s, chat_username, message_id, message_url, whitelist, target_ref) for s in batch]
+        batch_tasks = [_report_one_session_prem(s, chat_username, message_id, message_url, whitelist, target_ref, peer_ref) for s in batch]
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         results.extend(zip(batch, batch_results))
+        done_count += len(batch)
+        await pb.update(done_count)
         if i + BATCH_SIZE < len(_sessions):
             delay = random.uniform(3, 5)
             print(f"[PREM] ⏳ Пачка {i//BATCH_SIZE + 1} завершена, ждём {delay:.1f}с перед следующей...", flush=True)
             await asyncio.sleep(delay)
+    await pb.finish()
 
     valid, ne_valid, flood = 0, 0, 0
     log_lines = [
         "Brown V2 log | botnet-method [PREMIUM]",
         "-" * 42,
-        f"Пользователь: {user} (@{username})",
+        f"Пользователь: {user} (*@{username}*)",
         f"Ссылка: {message_url}",
         "-" * 42
     ]
@@ -1219,20 +1253,16 @@ async def main2(chat_username, message_id, user, username, message_url):
 
         if status == "WHITELIST":
             print(f"[PREM] ⛔ Таргет в вайтлисте, прерываем", flush=True)
-            await bot.send_message(user, "🍕 *Какая-то ошибка!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
-            try:
-                await bot.send_message(target_ref[0], f"⚠️ *Попытка жалобы на* [сообщение]({message_url}) *от ID {user}!*", parse_mode="Markdown", disable_web_page_preview=True)
-            except:
-                pass
-            return
-        elif status == "NO_ID":
-            print(f"[PREM] ⚠️ Не удалось получить ID пользователя", flush=True)
-            await bot.send_message(user, "🍕 *Не удалось получить ID пользователя!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
-            return
-        elif status == "NOT_FOUND":
-            print(f"[PREM] ❌ Не могу получить ID — NOT_FOUND", flush=True)
-            await bot.send_message(user, "🍕 *Не могу получить ID этого пользователя!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
-            return
+            if not silent:
+                await bot.send_message(user, "🍕 *Какая-то ошибка!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
+                try:
+                    await bot.send_message(target_ref[0], f"⚠️ *Попытка жалобы на* [сообщение]({message_url}) *от ID {user}!*", parse_mode="Markdown", disable_web_page_preview=True)
+                except:
+                    pass
+            return (0, len(_sessions))
+        elif status in ("NO_ID", "NOT_FOUND"):
+            ne_valid += 1
+            log_lines.append(format_log_line(session, message_url, status))
         elif status == "ДОСТАВЛЕНО":
             valid += 1
             log_lines.append(format_log_line(session, message_url, "ДОСТАВЛЕНО"))
@@ -1248,7 +1278,7 @@ async def main2(chat_username, message_id, user, username, message_url):
 
     print(f"\n[PREM] {'='*50}", flush=True)
     print(f"[PREM] 🏁 Итоги:", flush=True)
-    print(f"[PREM] 🎯 Таргет: ID={TARGET}, @{target_username}", flush=True)
+    print(f"[PREM] 🎯 Таргет: ID={TARGET}, *@{target_username}*", flush=True)
     print(f"[PREM] ✅ Доставлено: {valid}", flush=True)
     print(f"[PREM] ❌ Не доставлено: {ne_valid}", flush=True)
     print(f"[PREM] 🌊 Флудов: {flood}", flush=True)
@@ -1257,7 +1287,7 @@ async def main2(chat_username, message_id, user, username, message_url):
     log_lines.append("-" * 42)
     log_lines.append("[TARGET]")
     log_lines.append(f"ID: {TARGET}")
-    log_lines.append(f"USERNAME: @{target_username}")
+    log_lines.append(f"USERNAME: *@{target_username}*")
     log_lines.append("-" * 42)
     log_lines.append(f"Успешно: {valid}")
     log_lines.append(f"Неуспешно: {ne_valid}")
@@ -1275,20 +1305,34 @@ async def main2(chat_username, message_id, user, username, message_url):
         f"🟢 *Успешно отправлено: {valid}*\n"
         f"🔴 *Не удалось отправить: {ne_valid}*"
     )
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user)
+        _log_uid = "скрыт" if _is_hid else str(user)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user), username
+
     caption_log = (
         f"📈 *Бот завершил работу*\n* └─📂 Метод: B0tN3t-method [PREMIUM]*\n\n"
-        f"🎯 *Таргет*\n*└─ ID: {TARGET}*\n*└─ USERNAME: @{target_username}*\n\n"
+        f"🎯 *Таргет*\n*└─ ID: {TARGET}*\n*└─ USERNAME: *@{target_username}**\n\n"
         f"🟢 *Успешно отправлено: {valid}*\n🔴 *Не удалось отправить: {ne_valid}*\n\n"
-        f"⛓️‍💥 *Ссылка:* [тык]({message_url})\n👤 *Пользователь:* {user} (@{username})"
+        f"⛓️‍💥 *Ссылка:* [тык]({message_url})\n👤 *Пользователь:* {_log_uid} (*@{_log_uname}*)"
     )
 
-    try:
-        await bot.send_document(user, types.InputFile(log_path), caption=caption_user, parse_mode="Markdown", reply_markup=keyboards.main_menu)
-        await main_bot.send_document(bot_logs, types.InputFile(log_path), caption=caption_log, parse_mode="Markdown")
-    except Exception as e:
-        print(f"Ошибка при отправке логов: {e}")
+    if not silent:
+        try:
+            await bot.send_document(user, types.InputFile(log_path), caption=caption_user, parse_mode="Markdown", reply_markup=keyboards.main_menu)
+        except Exception as e:
+            print(f"[BOTNET-PREM] Ошибка отправки пользователю: {e}")
+        try:
+            await main_bot.send_document(bot_logs, types.InputFile(log_path), caption=caption_log, parse_mode="Markdown")
+        except Exception as e:
+            print(f"[BOTNET-PREM] Ошибка отправки в логи: {e}")
 
     try:
         os.remove(log_path)
     except Exception as e:
         print(f"Не удалось удалить лог: {e}")
+
+    return (valid, len(_sessions))

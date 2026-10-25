@@ -12,7 +12,7 @@ from telethon.errors import FloodWaitError
 import config
 from config import bot_logs
 import keyboards
-from utils import now_msk
+from utils import now_msk, ProgressBar, esc_md
 
 logger = logging.getLogger(__name__)
 
@@ -199,10 +199,23 @@ async def _attack_with_session(session_path, idx, bot_username, proxies, reason_
         logger.warning(f"[BOT-SNOS] [{session_name}] failed to open session: {e}")
         return 0
     try:
-        try:
-            await asyncio.wait_for(client.connect(), timeout=10)
-        except asyncio.TimeoutError:
-            logger.warning(f"[BOT-SNOS] [{session_name}] timeout")
+        connected = False
+        for db_attempt in range(3):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=12)
+                connected = True
+                break
+            except (asyncio.TimeoutError, OSError):
+                if db_attempt == 2:
+                    logger.warning(f"[BOT-SNOS] [{session_name}] ОШИБКА СОЕДИНЕНИЯ")
+                    return 0
+                await asyncio.sleep(1)
+            except Exception as e:
+                if "database is locked" in str(e) and db_attempt < 2:
+                    await asyncio.sleep(random.uniform(1, 2))
+                else:
+                    raise
+        if not connected:
             return 0
 
         if not await client.is_user_authorized():
@@ -252,15 +265,16 @@ async def _attack_with_session(session_path, idx, bot_username, proxies, reason_
             pass
 
 
-async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
+async def main_bot_snos(bot_username, reason_key, user, username, bot_url, _log_user=None, silent: bool = False, notify_bot=None):
     from aiogram import types as aiogram_types
+    _notify = notify_bot or bot
 
     # Проверка белого списка
     try:
         import db as db_module
         check_target = bot_username.strip().lstrip('@').lower()
         if await db_module.is_target_whitelisted(check_target):
-            await bot.send_message(
+            await _notify.send_message(
                 user,
                 "*\u26d4 \u0426\u0435\u043b\u044c \u0432 \u0431\u0435\u043b\u043e\u043c \u0441\u043f\u0438\u0441\u043a\u0435!*\n"
                 "*\u0416\u0430\u043b\u043e\u0431\u044b \u043d\u0430 \u044d\u0442\u0443 \u0446\u0435\u043b\u044c \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d\u044b.*",
@@ -272,8 +286,8 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
                     bot_logs,
                     "*\u26a0 \u041f\u043e\u043f\u044b\u0442\u043a\u0430 \u0441\u043d\u0435\u0441\u0442\u0438 "
                     "\u0446\u0435\u043b\u044c \u0438\u0437 \u0431\u0435\u043b\u043e\u0433\u043e \u0441\u043f\u0438\u0441\u043a\u0430!*\n"
-                    f"*\u0426\u0435\u043b\u044c:* `{bot_username}`\n"
-                    f"*\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c:* `{user}` (@{username})\n"
+                    f"*\u0426\u0435\u043b\u044c:* {bot_username}\n"
+                    f"*\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c:* {user} (*@{username}*)\n"
                     "*\u041c\u0435\u0442\u043e\u0434:* \u0411\u043e\u0442-\u043c\u0435\u0442\u043e\u0434",
                     parse_mode="Markdown"
                 )
@@ -295,6 +309,9 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
     # Пачки по 8 — чтобы не было database is locked и массовых таймаутов
     BATCH_SIZE = 8
     results = []
+    pb = ProgressBar(_notify, user, total=total, title="🤖 *Бот-метод*", silent=silent)
+    await pb.start()
+    done_count = 0
     for i in range(0, total, BATCH_SIZE):
         batch = sessions[i:i + BATCH_SIZE]
         batch_results = await asyncio.gather(
@@ -304,8 +321,11 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
         )
         for r in batch_results:
             results.append(0 if isinstance(r, Exception) else r)
+        done_count += len(batch)
+        await pb.update(done_count)
         if i + BATCH_SIZE < total:
             await asyncio.sleep(2)
+    await pb.finish()
     successful = sum(results)
 
     logger.info(f"[BOT-SNOS] done: {successful}/{total}")
@@ -317,7 +337,7 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
     log_lines = [
         "Brown V2 log | bot-method",
         "-" * 42,
-        f"User: {user} (@{username})",
+        f"User: {user} (*@{username}*)",
         f"Target: {bot_url}",
         f"Time: {now_str}",
         "-" * 42,
@@ -332,6 +352,14 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user)
+        _log_uid = "\u0441\u043a\u0440\u044b\u0442" if _is_hid else str(user)
+        _log_uname = "\u0441\u043a\u0440\u044b\u0442" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user), username
+
     bot_url_escaped = bot_url.replace('_', '\\_')
     caption_user = (
         f"*\U0001f916 \u0411\u043e\u0442-\u043c\u0435\u0442\u043e\u0434 \u0437\u0430\u0432\u0435\u0440\u0448\u0451\u043d!*\n\n"
@@ -345,23 +373,29 @@ async def main_bot_snos(bot_username, reason_key, user, username, bot_url):
         f"*\U0001f3af \u0426\u0435\u043b\u044c:* {bot_url_escaped}\n"
         f"*\U0001f550 \u0412\u0440\u0435\u043c\u044f:* {now_str}\n"
         f"\U0001f7e2 {successful} | \U0001f534 {total - successful}\n"
-        f"\U0001f464 {user} (@{username})"
+        f"\U0001f464 {_log_uid} (*@{_log_uname}*)"
     )
 
-    try:
-        await bot.send_document(
-            user, aiogram_types.InputFile(log_path),
-            caption=caption_user, parse_mode="Markdown",
-            reply_markup=keyboards.main_menu
-        )
-        await main_bot.send_document(
-            bot_logs, aiogram_types.InputFile(log_path),
-            caption=caption_log, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"[BOT-SNOS] send error: {e}")
+    if not silent:
+        try:
+            await _notify.send_document(
+                user, aiogram_types.InputFile(log_path),
+                caption=caption_user, parse_mode="Markdown",
+                reply_markup=keyboards.main_menu
+            )
+        except Exception as e:
+            logger.error(f"[BOT-SNOS] user send error: {e}")
+        try:
+            await main_bot.send_document(
+                bot_logs, aiogram_types.InputFile(log_path),
+                caption=caption_log, parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"[BOT-SNOS] logs send error: {e}")
 
     try:
         os.remove(log_path)
     except Exception:
         pass
+
+    return (successful, total)

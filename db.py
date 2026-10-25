@@ -23,7 +23,8 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         async with _pool_lock:
             if _pool is None:  # double-check
-                _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+                _pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=25,
+                                                  command_timeout=15)
     return _pool
 
 
@@ -54,11 +55,39 @@ async def init_db():
             ("manual_confirmed", "INT DEFAULT 0"),
             ("lang", "TEXT DEFAULT 'ru'"),
             ("sub_expiry_notified", "BOOLEAN DEFAULT FALSE"),
+            ("is_hidden", "BOOLEAN DEFAULT TRUE"),
+            ("chatbot_enabled", "BOOLEAN DEFAULT FALSE"),
         ]:
             try:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}")
             except Exception:
                 pass
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS business_connections (
+                user_id       BIGINT PRIMARY KEY,
+                connection_id TEXT NOT NULL,
+                connected_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chatbot_mutes (
+                user_id  BIGINT,
+                chat_id  BIGINT,
+                until    TIMESTAMP,
+                PRIMARY KEY (user_id, chat_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chatbot_msg_cache (
+                user_id    BIGINT,
+                chat_id    BIGINT,
+                message_id INT,
+                from_id    BIGINT,
+                text       TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, chat_id, message_id)
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS promocode (
                 code TEXT UNIQUE,
@@ -97,6 +126,46 @@ async def init_db():
                 hour_window_start TIMESTAMPTZ DEFAULT '1999-01-01 00:00:00+00'
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_confirmed_methods (
+                user_id BIGINT NOT NULL,
+                method  TEXT    NOT NULL,
+                PRIMARY KEY (user_id, method)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                admin_id BIGINT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS log_entries (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tg_market_orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                session_file TEXT,
+                phone TEXT,
+                invoice_id TEXT,
+                payment_method TEXT DEFAULT 'sbp',
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Добавляем last_bot_token если нет (для существующих БД)
+        try:
+            await conn.execute("ALTER TABLE mirror_assignments ADD COLUMN IF NOT EXISTS last_bot_token TEXT DEFAULT '__main__'")
+        except Exception:
+            pass
         # Фикс NULL значений для старых пользователей
         await conn.execute("UPDATE users SET premium = 0 WHERE premium IS NULL")
         await conn.execute("UPDATE users SET free_reports = 0 WHERE free_reports IS NULL")
@@ -215,6 +284,18 @@ async def get_all_user_ids() -> list[int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [r["user_id"] for r in rows]
+
+
+async def get_all_users_with_mirrors() -> dict[int, str | None]:
+    """Один запрос: {user_id: mirror_token | None} для всех пользователей."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT u.user_id, ma.mirror_token
+            FROM users u
+            LEFT JOIN mirror_assignments ma ON ma.user_id = u.user_id
+        """)
+    return {r["user_id"]: r["mirror_token"] for r in rows}
 
 
 async def get_users_count() -> int:
@@ -349,10 +430,10 @@ async def increment_referral_count(referrer_id: int) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "UPDATE users SET referral_count = referral_count + 1 WHERE user_id = $1 RETURNING referral_count",
+            "UPDATE users SET referral_count = COALESCE(referral_count, 0) + 1 WHERE user_id = $1 RETURNING referral_count",
             referrer_id
         )
-        return row["referral_count"] if row else 0
+        return int(row["referral_count"]) if row and row["referral_count"] is not None else 1
 
 
 async def get_referral_count(user_id: int) -> int:
@@ -469,6 +550,11 @@ async def init_mirrors_table():
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS mirror_bonus_given INT DEFAULT 0")
         except Exception:
             pass
+        # Системные зеркала — только они раздаются gateway ботами
+        try:
+            await conn.execute("ALTER TABLE mirrors ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE")
+        except Exception:
+            pass
 
 
 async def _init_paid_invoices_table():
@@ -533,6 +619,14 @@ async def token_exists(token: str) -> bool:
 
 
 async def get_all_mirror_tokens() -> list[str]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT token FROM mirrors")
+        return [r["token"] for r in rows]
+
+
+async def get_all_mirror_tokens_user() -> list[str]:
+    """Все зеркала включая пользовательские (для статистики)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT token FROM mirrors")
@@ -648,6 +742,31 @@ async def set_manual_confirmed(user_id: int):
     async with pool.acquire() as conn:
         try:
             await conn.execute("UPDATE users SET manual_confirmed = 1 WHERE user_id = $1", user_id)
+        except Exception:
+            pass
+
+
+async def is_method_manual_confirmed(user_id: int, method: str) -> bool:
+    """Проверяет подтвердил ли пользователь мануал для конкретного метода."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM manual_confirmed_methods WHERE user_id=$1 AND method=$2",
+                user_id, method)
+            return row is not None
+        except Exception:
+            return False
+
+
+async def set_method_manual_confirmed(user_id: int, method: str):
+    """Помечает что пользователь прочитал мануал для конкретного метода."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO manual_confirmed_methods (user_id, method) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                user_id, method)
         except Exception:
             pass
 
@@ -852,9 +971,12 @@ async def init_monitors_table():
                 last_check TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Добавляем колонку если её нет (для существующих БД)
+        # Добавляем колонки если их нет (для существующих БД)
         await conn.execute("""
             ALTER TABLE monitors ADD COLUMN IF NOT EXISTS notify_silent BOOLEAN DEFAULT FALSE
+        """)
+        await conn.execute("""
+            ALTER TABLE monitors ADD COLUMN IF NOT EXISTS dead_strikes INT DEFAULT 0
         """)
 
 
@@ -933,6 +1055,27 @@ async def update_monitor_check(monitor_id: int, new_status: str):
         )
 
 
+async def increment_monitor_dead_strikes(monitor_id: int) -> int:
+    """Увеличивает счётчик подряд-dead. Возвращает новое значение."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE monitors SET dead_strikes = dead_strikes + 1 WHERE id = $1 RETURNING dead_strikes",
+            monitor_id
+        )
+        return row["dead_strikes"] if row else 1
+
+
+async def reset_monitor_dead_strikes(monitor_id: int):
+    """Сбрасывает счётчик dead_strikes при живой цели."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE monitors SET dead_strikes = 0 WHERE id = $1",
+            monitor_id
+        )
+
+
 async def mark_monitor_notified(monitor_id: int):
     """Помечает монитор как уведомлённый."""
     pool = await get_pool()
@@ -993,6 +1136,16 @@ async def init_attack_log_table():
         await conn.execute("CREATE INDEX IF NOT EXISTS attack_log_user_idx ON attack_log(user_id, created_at DESC)")
 
 
+async def clear_attack_log_current_week():
+    """Очищает записи текущей недели (сброс к нулю)."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM attack_log WHERE created_at >= $1", week_start)
+
+
 async def log_attack(user_id: int, target_url: str, method: str, success_count: int = 0):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1002,14 +1155,21 @@ async def log_attack(user_id: int, target_url: str, method: str, success_count: 
         )
 
 
-async def get_attack_history(user_id: int, limit: int = 15) -> list:
+async def get_attack_history(user_id: int, limit: int = 10, offset: int = 0) -> list:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT target_url, method, success_count, created_at FROM attack_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
-            user_id, limit
+            "SELECT target_url, method, success_count, created_at FROM attack_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            user_id, limit, offset
         )
         return [dict(r) for r in rows]
+
+
+async def get_attack_history_count(user_id: int) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT COUNT(*) as cnt FROM attack_log WHERE user_id = $1", user_id)
+        return row["cnt"] if row else 0
 
 
 # ─── Уведомления об истечении подписки ───────────────────────────────────────
@@ -1045,6 +1205,58 @@ async def reset_sub_expiry_notified(user_id: int):
             "UPDATE users SET sub_expiry_notified = FALSE WHERE user_id = $1",
             user_id
         )
+
+
+# ─── Еженедельный рейтинг ────────────────────────────────────────────────────
+
+async def init_leaderboard_table():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS leaderboard_winners (
+                id SERIAL PRIMARY KEY,
+                week_start DATE NOT NULL,
+                place INT NOT NULL,
+                user_id BIGINT NOT NULL,
+                username TEXT DEFAULT '',
+                total_reports INT NOT NULL DEFAULT 0,
+                stars_prize INT NOT NULL DEFAULT 0,
+                paid BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+
+async def get_weekly_top3(week_start, week_end) -> list:
+    """Топ-3 пользователей по количеству репортов за период."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT al.user_id,
+                   COALESCE(u.username, '') AS username,
+                   COUNT(*) AS total
+            FROM attack_log al
+            LEFT JOIN users u ON u.user_id = al.user_id
+            WHERE al.created_at >= $1 AND al.created_at < $2
+            GROUP BY al.user_id, u.username
+            ORDER BY total DESC
+            LIMIT 3
+        """, week_start, week_end)
+        return [dict(r) for r in rows]
+
+
+async def save_leaderboard_winners(week_start, winners: list):
+    """Сохраняет победителей недели в историю."""
+    _PRIZES = {1: 150, 2: 75, 3: 50}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for i, row in enumerate(winners, 1):
+            await conn.execute("""
+                INSERT INTO leaderboard_winners (week_start, place, user_id, username, total_reports, stars_prize)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT DO NOTHING
+            """, week_start.date(), i, row['user_id'], row['username'],
+                int(row['total']), _PRIZES.get(i, 0))
 
 
 # ─── Пробив — лимиты ──────────────────────────────────────────────────────────
@@ -1093,3 +1305,444 @@ async def record_probiv_request(user_id: int, now_dt):
                    SET last_request_at = $2, hour_count = $3, hour_window_start = $4""",
                 user_id, now_dt, new_count, new_window
             )
+
+
+async def get_is_hidden(user_id: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT is_hidden FROM users WHERE user_id = $1", user_id)
+        return bool(row["is_hidden"]) if row else False
+
+
+async def toggle_hidden(user_id: int) -> bool:
+    """Переключает is_hidden, возвращает новое значение."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT is_hidden FROM users WHERE user_id = $1", user_id)
+        new_val = not bool(row["is_hidden"]) if row else True
+        await conn.execute("UPDATE users SET is_hidden = $1 WHERE user_id = $2", new_val, user_id)
+        return new_val
+
+
+# ─── Крипто-кошельки (ротация) ────────────────────────────────────────────────
+
+async def init_crypto_wallets_table():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_wallets (
+                slot INT PRIMARY KEY CHECK (slot BETWEEN 1 AND 5),
+                address TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT FALSE
+            )
+        """)
+
+
+async def get_active_wallet() -> str | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT address FROM crypto_wallets WHERE is_active = TRUE LIMIT 1")
+        return row["address"] if row else None
+
+
+async def get_all_wallets() -> list:
+    """Возвращает все слоты [{'slot': 1, 'address': '...', 'is_active': True/False}, ...]."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT slot, address, is_active FROM crypto_wallets ORDER BY slot")
+        return [dict(r) for r in rows]
+
+
+async def set_wallet_slot(slot: int, address: str):
+    """Добавляет или обновляет кошелёк в указанном слоте (1-5)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO crypto_wallets (slot, address, is_active) VALUES ($1, $2, FALSE) "
+            "ON CONFLICT (slot) DO UPDATE SET address = $2",
+            slot, address
+        )
+
+
+async def remove_wallet_slot(slot: int):
+    """Удаляет кошелёк из слота. Если он был активным — ротация на следующий."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT is_active FROM crypto_wallets WHERE slot = $1", slot)
+        was_active = row["is_active"] if row else False
+        await conn.execute("DELETE FROM crypto_wallets WHERE slot = $1", slot)
+    if was_active:
+        await rotate_wallet()
+
+
+async def rotate_wallet() -> str | None:
+    """Переключает активный кошелёк на следующий. Возвращает новый адрес или None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT slot, address FROM crypto_wallets ORDER BY slot"
+        )
+        if not rows:
+            return None
+        slots = [dict(r) for r in rows]
+        active_row = await conn.fetchrow("SELECT slot FROM crypto_wallets WHERE is_active = TRUE LIMIT 1")
+        current_slot = active_row["slot"] if active_row else 0
+
+        # Ищем следующий слот после текущего (с wraparound)
+        next_entry = None
+        for entry in slots:
+            if entry["slot"] > current_slot:
+                next_entry = entry
+                break
+        if next_entry is None:
+            next_entry = slots[0]  # wraparound
+
+        await conn.execute("UPDATE crypto_wallets SET is_active = FALSE WHERE is_active = TRUE")
+        await conn.execute("UPDATE crypto_wallets SET is_active = TRUE WHERE slot = $1", next_entry["slot"])
+        return next_entry["address"]
+
+
+# ─── Gateway / Mirror assignments ─────────────────────────────────────────────
+
+async def init_gateway_tables():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mirror_assignments (
+                user_id BIGINT PRIMARY KEY,
+                mirror_token TEXT NOT NULL,
+                gateway_bot_id INT DEFAULT 1,
+                assigned_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+
+async def get_user_mirror(user_id: int) -> str | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT mirror_token FROM mirror_assignments WHERE user_id = $1", user_id
+        )
+
+
+async def assign_mirror_to_user(user_id: int, mirror_token: str, gateway_bot_id: int = 1):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO mirror_assignments (user_id, mirror_token, gateway_bot_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET mirror_token = $2, gateway_bot_id = $3, assigned_at = NOW()
+        """, user_id, mirror_token, gateway_bot_id)
+
+
+async def touch_user_mirror(user_id: int, mirror_token: str):
+    """Обновляет активное зеркало юзера не меняя gateway_bot_id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO mirror_assignments (user_id, mirror_token, gateway_bot_id, last_bot_token)
+            VALUES ($1, $2, 0, $2)
+            ON CONFLICT (user_id) DO UPDATE SET mirror_token = $2, assigned_at = NOW(), last_bot_token = $2
+        """, user_id, mirror_token)
+
+
+async def touch_user_main_bot(user_id: int):
+    """Фиксирует, что юзер последний раз взаимодействовал с основным ботом."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                INSERT INTO mirror_assignments (user_id, mirror_token, gateway_bot_id, last_bot_token)
+                VALUES ($1, '', 0, '__main__')
+                ON CONFLICT (user_id) DO UPDATE SET last_bot_token = '__main__', assigned_at = NOW()
+            """, user_id)
+        except Exception:
+            pass
+
+
+async def get_user_last_bot(user_id: int) -> str:
+    """Возвращает '__main__' или токен зеркала — через что юзер писал последний раз."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            val = await conn.fetchval(
+                "SELECT last_bot_token FROM mirror_assignments WHERE user_id = $1", user_id
+            )
+            return val or '__main__'
+        except Exception:
+            return '__main__'
+
+
+async def get_free_mirror(exclude: str = None) -> str | None:
+    """Возвращает токен зеркала с наименьшим числом назначений.
+    Сначала ищет незанятое, иначе возвращает наименее загруженное."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        exclude_clause = "AND m.token != $1" if exclude else ""
+        params = [exclude] if exclude else []
+        # Берём зеркало с минимумом назначений
+        row = await conn.fetchrow(f"""
+            SELECT m.token, COUNT(a.user_id) as cnt
+            FROM mirrors m
+            LEFT JOIN mirror_assignments a ON a.mirror_token = m.token
+            WHERE 1=1 {exclude_clause}
+            GROUP BY m.token
+            ORDER BY cnt ASC
+            LIMIT 1
+        """, *params)
+        return row["token"] if row else None
+
+
+async def add_system_mirror(token: str, bot_username: str):
+    """Добавляет системное зеркало (для gateway). user_id=0 — наше."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO mirrors (token, user_id, bot_username, is_system)
+            VALUES ($1, 0, $2, TRUE)
+            ON CONFLICT (token) DO UPDATE SET is_system = TRUE, bot_username = $2
+        """, token, bot_username)
+
+
+async def get_mirror_user_count(mirror_token: str) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM mirror_assignments WHERE mirror_token = $1", mirror_token
+        ) or 0
+
+
+# ─── TG Маркет ────────────────────────────────────────────────────────────────
+
+async def create_market_order(user_id: int, payment_method: str) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO tg_market_orders (user_id, payment_method) VALUES ($1, $2) RETURNING id",
+            user_id, payment_method
+        )
+        return row["id"]
+
+
+async def fulfill_market_order(order_id: int, session_file: str, phone: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tg_market_orders SET session_file=$1, phone=$2, status='paid' WHERE id=$3",
+            session_file, phone, order_id
+        )
+
+
+async def get_market_order(order_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM tg_market_orders WHERE id=$1", order_id)
+        return dict(row) if row else None
+
+
+async def get_user_active_market_order(user_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM tg_market_orders WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1",
+            user_id
+        )
+        return dict(row) if row else None
+
+
+async def set_market_order_invoice(order_id: int, invoice_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tg_market_orders SET invoice_id=$1 WHERE id=$2",
+            invoice_id, order_id
+        )
+
+
+async def get_market_order_by_invoice(invoice_id: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM tg_market_orders WHERE invoice_id=$1", invoice_id
+        )
+        return dict(row) if row else None
+
+
+async def get_user_fulfilled_market_orders(user_id: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM tg_market_orders WHERE user_id=$1 AND status='paid' ORDER BY created_at DESC LIMIT 10",
+            user_id
+        )
+        return [dict(r) for r in rows]
+
+
+# ─── Предупреждения ───────────────────────────────────────────────────────────
+
+async def add_warning(user_id: int, admin_id: int, reason: str) -> int:
+    """Добавляет предупреждение. Возвращает новый счётчик предупреждений."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO warnings (user_id, admin_id, reason) VALUES ($1, $2, $3)",
+            user_id, admin_id, reason
+        )
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM warnings WHERE user_id = $1", user_id
+        )
+
+
+async def get_warning_count(user_id: int) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM warnings WHERE user_id = $1", user_id
+        ) or 0
+
+
+async def get_warnings(user_id: int, limit: int = 20, offset: int = 0) -> list:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, admin_id, reason, created_at FROM warnings WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            user_id, limit, offset
+        )
+        return [dict(r) for r in rows]
+
+
+async def add_log_entry(user_id: int) -> int:
+    """Создаёт запись лога, возвращает её ID."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO log_entries (user_id) VALUES ($1) RETURNING id",
+            user_id
+        )
+
+
+async def get_log_entry_user(log_id: int) -> int | None:
+    """Возвращает user_id по ID лога, или None если не найден."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT user_id FROM log_entries WHERE id = $1",
+            log_id
+        )
+
+
+# ─── Chatbot (Business Bot API) ───────────────────────────────────────────────
+
+async def chatbot_save_connection(user_id: int, connection_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO business_connections (user_id, connection_id)
+               VALUES ($1, $2)
+               ON CONFLICT (user_id) DO UPDATE SET connection_id=$2, connected_at=NOW()""",
+            user_id, connection_id
+        )
+        await conn.execute(
+            "UPDATE users SET chatbot_enabled=TRUE WHERE user_id=$1", user_id
+        )
+
+
+async def chatbot_remove_connection(user_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM business_connections WHERE user_id=$1", user_id)
+        await conn.execute(
+            "UPDATE users SET chatbot_enabled=FALSE WHERE user_id=$1", user_id
+        )
+
+
+async def chatbot_get_connection(user_id: int) -> str | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT connection_id FROM business_connections WHERE user_id=$1", user_id
+        )
+
+
+async def chatbot_get_user_by_connection(connection_id: str) -> int | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT user_id FROM business_connections WHERE connection_id=$1", connection_id
+        )
+
+
+async def chatbot_is_enabled(user_id: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT chatbot_enabled FROM users WHERE user_id=$1", user_id
+        )
+        return bool(val)
+
+
+async def chatbot_set_mute(user_id: int, chat_id: int, until=None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO chatbot_mutes (user_id, chat_id, until)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, chat_id) DO UPDATE SET until=$3""",
+            user_id, chat_id, until
+        )
+
+
+async def chatbot_remove_mute(user_id: int, chat_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM chatbot_mutes WHERE user_id=$1 AND chat_id=$2",
+            user_id, chat_id
+        )
+
+
+async def chatbot_is_muted(user_id: int, chat_id: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT until FROM chatbot_mutes WHERE user_id=$1 AND chat_id=$2",
+            user_id, chat_id
+        )
+        if not row:
+            return False
+        if row['until'] is None:
+            return True
+        from utils import now_msk
+        return now_msk() < row['until'].replace(tzinfo=None)
+
+
+async def chatbot_cache_message(user_id: int, chat_id: int, message_id: int, from_id: int, text: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO chatbot_msg_cache (user_id, chat_id, message_id, from_id, text)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id, chat_id, message_id) DO NOTHING""",
+            user_id, chat_id, message_id, from_id, text
+        )
+
+
+async def chatbot_get_cached_messages(user_id: int, chat_id: int, message_ids: list) -> list:
+    if not message_ids:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT message_id, from_id, text FROM chatbot_msg_cache
+               WHERE user_id=$1 AND chat_id=$2 AND message_id=ANY($3::int[])""",
+            user_id, chat_id, message_ids
+        )
+        return [dict(r) for r in rows]
+
+
+async def chatbot_clean_old_cache():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM chatbot_msg_cache WHERE created_at < NOW() - INTERVAL '48 hours'"
+        )

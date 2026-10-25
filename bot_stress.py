@@ -20,6 +20,7 @@ from telethon.tl.types import ReplyInlineMarkup, KeyboardButtonCallback
 import config
 from config import bot_logs
 import keyboards
+from utils import esc_md
 
 API = [
     '24565698:5a084b434f8505ace703485b9da85040',
@@ -36,6 +37,7 @@ API = [
 STRESS_DURATION = 5 * 60  # 5 минут в секундах
 
 bot = None
+main_bot = None
 session_folder = 'sessions'
 os.makedirs(session_folder, exist_ok=True)
 
@@ -46,8 +48,10 @@ def _get_sessions():
 
 
 def set_bot_stress(b):
-    global bot
+    global bot, main_bot
     bot = b
+    if main_bot is None:
+        main_bot = b
 
 
 def _get_client(session: str) -> TelegramClient:
@@ -74,7 +78,18 @@ async def find_inline_button(bot_username: str) -> tuple[int | None, bytes | Non
             system_version='4.16.30-vxCUSTOM'
         )
         try:
-            await asyncio.wait_for(client.connect(), timeout=8)
+            connected = False
+            for _a in range(3):
+                try:
+                    await asyncio.wait_for(client.connect(), timeout=12)
+                    connected = True
+                    break
+                except (asyncio.TimeoutError, OSError):
+                    if _a == 2:
+                        break
+                    await asyncio.sleep(1)
+            if not connected:
+                continue
             if not await client.is_user_authorized():
                 await client.disconnect()
                 continue
@@ -126,7 +141,19 @@ async def _spam_callback_session(session: str, bot_username: str, msg_id: int, b
     errors = 0
     use_callback = False  # флаг — переключились на callback
     try:
-        await asyncio.wait_for(client.connect(), timeout=8)
+        connected = False
+        for _a in range(3):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=12)
+                connected = True
+                break
+            except (asyncio.TimeoutError, OSError):
+                if _a == 2:
+                    print(f"[STRESS] [{session}] ❌ ОШИБКА СОЕДИНЕНИЯ", flush=True)
+                    return 0
+                await asyncio.sleep(1)
+        if not connected:
+            return 0
         if not await client.is_user_authorized():
             print(f"[STRESS] [{session}] ❌ НЕВАЛИД", flush=True)
             return 0
@@ -183,12 +210,13 @@ async def _spam_callback_session(session: str, bot_username: str, msg_id: int, b
     return count_msg + count_cb
 
 
-async def main_bot_stress(bot_username: str, user_id: int, username: str, is_admin: bool):
+async def main_bot_stress(bot_username: str, user_id: int, username: str, is_admin: bool, notify_bot=None):
     """Главная функция стрессера — ротация сессий по 2 за раз, 3 сообщения в секунду."""
+    _notify = notify_bot or bot
     print(f"\n{'='*50}", flush=True)
     print(f"[STRESS] 🚀 Стрессер запущен", flush=True)
     print(f"[STRESS] 🎯 Цель: {bot_username}", flush=True)
-    print(f"[STRESS] 👤 Пользователь: {user_id} (@{username})", flush=True)
+    print(f"[STRESS] 👤 Пользователь: {user_id} (*@{username}*)", flush=True)
     print(f"{'='*50}", flush=True)
 
     # Шаг 1: найти inline кнопку
@@ -198,7 +226,7 @@ async def main_bot_stress(bot_username: str, user_id: int, username: str, is_adm
     if not msg_id or not btn_data:
         print(f"[STRESS] ❌ Inline кнопки не найдены", flush=True)
         from aiogram import types as aiogram_types
-        await bot.send_message(
+        await _notify.send_message(
             user_id,
             "❌ *У этого бота нет inline кнопок!*\n*Стрессер работает только с ботами у которых есть кнопки.*",
             parse_mode="Markdown",
@@ -208,7 +236,7 @@ async def main_bot_stress(bot_username: str, user_id: int, username: str, is_adm
 
     print(f"[STRESS] ✅ Кнопка найдена, запускаем ротационную атаку на {STRESS_DURATION//60} минут...", flush=True)
     print(f"[STRESS] 📦 Сессий: {len(_get_sessions())} | msg_id={msg_id} | btn_data={btn_data!r}", flush=True)
-    await bot.send_message(
+    await _notify.send_message(
         user_id,
         f"⚡️ *Стрессер запущен!*\n*└─ Цель: {bot_username}*\n*└─ Продолжительность: 5 минут*\n*└─ Ротация 2 сессии/сек × 3 сообщения*",
         parse_mode="Markdown"
@@ -245,7 +273,7 @@ async def main_bot_stress(bot_username: str, user_id: int, username: str, is_adm
     print(f"[STRESS] ✅ Подключено {len(valid_sessions)} валидных сессий", flush=True)
 
     if not valid_sessions:
-        await bot.send_message(user_id, "❌ *Нет валидных сессий!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
+        await _notify.send_message(user_id, "❌ *Нет валидных сессий!*", parse_mode="Markdown", reply_markup=keyboards.main_menu)
         return False
 
     # Сессии на удаление собираем в set, чтобы избежать race condition при параллельном remove
@@ -306,15 +334,16 @@ async def main_bot_stress(bot_username: str, user_id: int, username: str, is_adm
     print(f"[STRESS] 🏁 Итог: {total_sent} сообщений за {STRESS_DURATION//60} минут", flush=True)
     print(f"[STRESS] {'='*50}\n", flush=True)
 
-    await bot.send_message(
+    _log_bot = main_bot or bot
+    await _log_bot.send_message(
         bot_logs,
         f"⚡️ *Стрессер завершён*\n"
         f"*└─ Цель: {bot_username}*\n"
         f"*└─ Сообщений отправлено: {total_sent}*\n"
-        f"*└─ Пользователь: {user_id} (@{username})*",
+        f"*└─ Пользователь: {user_id} (*@{username}*)*",
         parse_mode="Markdown"
     )
-    await bot.send_message(
+    await _notify.send_message(
         user_id,
         f"✅ *Стрессер завершён!*\n*└─ Отправлено {total_sent} сообщений за 5 минут*",
         parse_mode="Markdown",

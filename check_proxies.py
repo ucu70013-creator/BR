@@ -35,12 +35,21 @@ def load_proxies(path: str) -> list[str]:
         return []
 
 
+def proxy_url(raw: str, scheme: str) -> str:
+    parts = raw.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"{scheme}://{user}:{pwd}@{esc_md(host)}:{port}"
+    return f"{scheme}://{raw}"
+
+
 async def check_http(session: aiohttp.ClientSession, proxy: str, sem: asyncio.Semaphore):
     async with sem:
         try:
+            url = proxy_url(proxy, "http")
             async with session.get(
                 TEST_URL,
-                proxy=f"http://{proxy}",
+                proxy=url,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
                 ssl=False
             ) as r:
@@ -54,10 +63,14 @@ async def check_http(session: aiohttp.ClientSession, proxy: str, sem: asyncio.Se
 async def check_socks(proxy: str, sem: asyncio.Semaphore, ptype: ProxyType, label: str):
     async with sem:
         try:
+            parts = proxy.split(":")
+            host, port = parts[0], int(parts[1])
+            user = parts[2] if len(parts) >= 4 else None
+            pwd  = parts[3] if len(parts) >= 4 else None
             connector = ProxyConnector(
                 proxy_type=ptype,
-                host=proxy.split(":")[0],
-                port=int(proxy.split(":")[1]),
+                host=host, port=port,
+                username=user, password=pwd,
                 rdns=True
             )
             async with aiohttp.ClientSession(connector=connector) as s:

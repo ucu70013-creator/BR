@@ -17,7 +17,7 @@ from playwright.async_api import async_playwright, Page
 import config
 from config import bot_logs
 import keyboards
-from utils import now_msk
+from utils import now_msk, ProgressBar, esc_md
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ async def generate_complaint_text(reason: str, sub_reason: str, message_text: st
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "qwen/qwen3.6-27b",
+                    "model": "llama-3.3-70b-versatile",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content}
@@ -339,11 +339,24 @@ async def _run_single_report(target_link: str, reason_radio: str, sub_reason_rad
             """, token)
             await asyncio.sleep(1)
 
+            # Закрываем алерт-попап если он перекрывает кнопку
+            try:
+                await page.evaluate("""
+                    () => {
+                        const popup = document.querySelector('.popup-container.alert-popup-container, .aj_popup');
+                        if (popup) popup.remove();
+                        document.querySelectorAll('.popup-overlay, .modal-overlay').forEach(el => el.remove());
+                    }
+                """)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
             btn = await page.query_selector(".js-report-start-btn")
             if btn:
                 try:
                     async with page.expect_popup(timeout=8000) as popup_info:
-                        await btn.click()
+                        await btn.click(force=True)
                     oauth_page = await popup_info.value
                     await oauth_page.wait_for_load_state("domcontentloaded", timeout=10000)
                     await asyncio.sleep(1)
@@ -359,7 +372,7 @@ async def _run_single_report(target_link: str, reason_radio: str, sub_reason_rad
                             continue
                 except Exception as e:
                     logger.warning(f"[DSA] popup: {e}")
-                    await btn.click()
+                    await btn.click(force=True)
                     await asyncio.sleep(2)
 
             if not await _wait_element(page, ".cd-comment-input", timeout=40):
@@ -439,9 +452,20 @@ async def _run_single_report(target_link: str, reason_radio: str, sub_reason_rad
 
         except Exception as e:
             import traceback
+            tb = traceback.format_exc()
             print(f"[DSA] ошибка в репорте: {e}", flush=True)
-            print(f"[DSA] traceback: {traceback.format_exc()}", flush=True)
+            print(f"[DSA] traceback: {tb}", flush=True)
             logger.error(f"[DSA] ошибка: {e}")
+            try:
+                err_short = str(e)[:300]
+                if main_bot:
+                    await main_bot.send_message(
+                        bot_logs,
+                        f"🇪🇺 *DSA ERROR*\n`{err_short}`",
+                        parse_mode="Markdown"
+                    )
+            except Exception:
+                pass
             return False
         finally:
             await browser.close()
@@ -450,7 +474,7 @@ async def _run_single_report(target_link: str, reason_radio: str, sub_reason_rad
 # ─── Главная функция ──────────────────────────────────────────────────────────
 async def main_dsa_snos(target_link: str, user: int, username: str,
                          reason_key: str, sub_key: str, complaint_text: str,
-                         count: int = 1, _bot=None):
+                         count: int = 1, _bot=None, silent: bool = False):
     _send_bot = _bot or bot
 
     target = target_link.strip()
@@ -470,14 +494,18 @@ async def main_dsa_snos(target_link: str, user: int, username: str,
     successful = 0
     failed = 0
 
+    pb = ProgressBar(_send_bot, user, total=count, title="🇪🇺 *DSA Report*", silent=silent)
+    await pb.start()
     for i in range(count):
         result = await _run_single_report(target, reason_radio, sub_reason_radio, complaint_text)
         if result:
             successful += 1
         else:
             failed += 1
+        await pb.update(i + 1)
         if i + 1 < count:
             await asyncio.sleep(random.uniform(3, 6))
+    await pb.finish()
 
     now_str = now_msk().strftime("%d.%m.%Y %H:%M:%S")
     target_escaped = target.replace('_', '\\_')
@@ -491,26 +519,36 @@ async def main_dsa_snos(target_link: str, user: int, username: str,
         f"🟢 *Успешно: {successful}*\n"
         f"🔴 *Не удалось: {failed}*"
     )
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user)
+        _log_uid = "скрыт" if _is_hid else str(user)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user), username
+
     caption_log = (
         f"🇪🇺 *DSA Report*\n\n"
         f"🎯 *Цель:* {target_escaped}\n"
         f"📋 *Причина:* {reason_escaped}"
         + (f" → {sub_label}" if sub_label else "") + "\n"
-        f"👤 *Пользователь:* {user} (@{username})\n"
+        f"👤 *Пользователь:* {_log_uid} (*@{_log_uname}*)\n"
         f"🕐 *Время:* {now_str}\n\n"
         f"🟢 *Успешно: {successful}*\n"
         f"🔴 *Не удалось: {failed}*"
     )
 
-    try:
-        await _send_bot.send_message(user, caption_user, parse_mode="Markdown",
-                                     reply_markup=keyboards.main_menu)
-        # Для лога всегда используем основной бот
+    if not silent:
         try:
-            from main import bot as _main_bot
-            await _main_bot.send_message(bot_logs, caption_log, parse_mode="Markdown")
-        except Exception:
-            if main_bot:
-                await main_bot.send_message(bot_logs, caption_log, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"[DSA] ошибка отправки результата: {e}")
+            await _send_bot.send_message(user, caption_user, parse_mode="Markdown",
+                                         reply_markup=keyboards.main_menu)
+            try:
+                from main import bot as _main_bot
+                await _main_bot.send_message(bot_logs, caption_log, parse_mode="Markdown")
+            except Exception:
+                if main_bot:
+                    await main_bot.send_message(bot_logs, caption_log, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"[DSA] ошибка отправки результата: {e}")
+
+    return (successful, count)

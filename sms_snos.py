@@ -10,7 +10,7 @@ import random
 import string
 
 import aiohttp
-from utils import now_msk
+from utils import now_msk, esc_md
 
 LOG_FOLDER = "logs"
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -27,7 +27,7 @@ def set_bot_sms(b):
 
 def _rand_email():
     chars = string.ascii_lowercase
-    return f"{''.join(random.choices(chars, k=9))}@{''.join(random.choices(chars, k=5))}.ru"
+    return f"{''.join(random.choices(chars, k=9))}@{esc_md(''.join(random.choices(chars, k=5)))}.ru"
 
 
 async def _do_req(session: aiohttp.ClientSession, name: str, method: str, url: str, **kwargs) -> tuple:
@@ -398,16 +398,17 @@ def _build_tasks(session: aiohttp.ClientSession, phone: str) -> list:
     ]
 
 
-async def main_sms_snos(phone: str, user_id: int, username: str):
+async def main_sms_snos(phone: str, user_id: int, username: str, notify_bot=None):
     """
     phone — формат 79991234567 (без +)
     """
+    _notify = notify_bot or bot
     from config import bot_logs
     import keyboards
     from aiogram import types as aiogram_types
 
     print(f"\n{'='*55}", flush=True)
-    print(f"[SMS] 🚀 SMS-бомбер | +{phone} | {user_id} (@{username})", flush=True)
+    print(f"[SMS] 🚀 SMS-бомбер | +{phone} | {user_id} (*@{username}*)", flush=True)
     print(f"{'='*55}", flush=True)
 
     connector = aiohttp.TCPConnector(ssl=False, limit=100)
@@ -426,7 +427,7 @@ async def main_sms_snos(phone: str, user_id: int, username: str):
     log_lines = [
         "Brown V2 | SMS-бомбер",
         "=" * 50,
-        f"Пользователь : {user_id} (@{username})",
+        f"Пользователь : {user_id} (*@{username}*)",
         f"Номер        : +{phone}",
         f"Сервисов     : {total}",
         f"Дата         : {now_msk().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -446,21 +447,29 @@ async def main_sms_snos(phone: str, user_id: int, username: str):
 
     caption_user = (
         f"💬 *SMS-бомбер завершён!*\n"
-        f"*└─ Номер:* `+{phone}`\n\n"
-        f"*Сервисов:* `{total}`\n"
+        f"*└─ Номер:* +{phone}\n\n"
+        f"*Сервисов:* {total}\n"
         f"✅ *Успешно: {ok}*\n"
         f"⏱ *Таймаут: {timeout}*\n"
         f"❌ *Ошибок: {err}*"
     )
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user_id)
+        _log_uid = "скрыт" if _is_hid else str(user_id)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user_id), username
+
     caption_log = (
         f"💬 *SMS-бомбер*\n"
-        f"*└─ Номер:* `+{phone}`\n"
+        f"*└─ Номер:* +{phone}\n"
         f"✅ {ok} | ⏱ {timeout} | ❌ {err}\n"
-        f"👤 {user_id} (@{username})"
+        f"👤 {_log_uid} (*@{_log_uname}*)"
     )
 
     try:
-        await bot.send_document(
+        await _notify.send_document(
             user_id, aiogram_types.InputFile(log_path),
             caption=caption_user, parse_mode="Markdown",
             reply_markup=keyboards.main_menu,

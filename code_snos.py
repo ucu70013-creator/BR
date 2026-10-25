@@ -11,7 +11,7 @@ import os
 import random
 
 import aiohttp
-from utils import now_msk
+from utils import now_msk, esc_md
 from aiohttp_socks import ProxyConnector, ProxyType
 
 LOG_FOLDER = "logs"
@@ -164,7 +164,7 @@ async def _send_one_code(phone: str, proxy_url: str | None, attempt: int, used_u
     ua = random.choice(available)
     used_uas.add(ua)
 
-    proxy_label = proxy_url[:35] if proxy_url else "direct"
+    proxy_label = ":".join(proxy_url.split(":")[:2]) if proxy_url else "direct"
 
     # Парсим прокси для telethon
     telethon_proxy = None
@@ -234,7 +234,8 @@ async def _send_one_code(phone: str, proxy_url: str | None, attempt: int, used_u
 
 
 
-async def main_code_snos(phone: str, user_id: int, username: str):
+async def main_code_snos(phone: str, user_id: int, username: str, notify_bot=None):
+    _notify = notify_bot or bot
     from config import bot_logs
     import keyboards
     from aiogram import types as aiogram_types
@@ -244,7 +245,7 @@ async def main_code_snos(phone: str, user_id: int, username: str):
     print(f"\n{'='*50}", flush=True)
     print(f"[CODE] 🚀 Запуск code-метода", flush=True)
     print(f"[CODE] 📱 Номер: {phone}", flush=True)
-    print(f"[CODE] 👤 {user_id} (@{username})", flush=True)
+    print(f"[CODE] 👤 {user_id} (*@{username}*)", flush=True)
     print(f"[CODE] 🔗 Прокси: {len(proxies)}", flush=True)
     print(f"[CODE] 🎯 Отправляем {CODES_COUNT} кодов...", flush=True)
     print(f"{'='*50}", flush=True)
@@ -288,14 +289,14 @@ async def main_code_snos(phone: str, user_id: int, username: str):
     log_lines = [
         "Brown V2 log | code-method",
         "-" * 42,
-        f"Пользователь: {user_id} (@{username})",
+        f"Пользователь: {user_id} (*@{username}*)",
         f"Номер: {phone}",
         f"Всего запросов: {CODES_COUNT}",
         f"Прокси использовано: {len(set(p for p, _ in results if p))}",
         "-" * 42,
     ]
     for i, (proxy, status) in enumerate(results, 1):
-        p_label = proxy[:40] if proxy else "direct"
+        p_label = ":".join(proxy.split(":")[:2]) if proxy else "direct"
         if status == "OK":
             log_lines.append(f"[{now_msk().strftime('%H:%M:%S')}] #{i:02d} {p_label} → ✅ OK")
         elif status.startswith("FLOOD"):
@@ -316,20 +317,28 @@ async def main_code_snos(phone: str, user_id: int, username: str):
 
     caption_user = (
         f"📱 *Код-метод завершён!*\n"
-        f"*└─ Номер:* `{phone}`\n\n"
+        f"*└─ Номер:* {phone}\n\n"
         f"✅ *Отправлено кодов: {ok}/{CODES_COUNT}*\n"
         f"🌊 *Флуд: {flood}*\n"
         f"❌ *Ошибок: {err}*"
     )
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user_id)
+        _log_uid = "скрыт" if _is_hid else str(user_id)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user_id), username
+
     caption_log = (
         f"📱 *code-method*\n"
-        f"*└─ Номер:* `{phone}`\n\n"
+        f"*└─ Номер:* {phone}\n\n"
         f"✅ {ok} | 🌊 {flood} | ❌ {err}\n"
-        f"👤 {user_id} (@{username})"
+        f"👤 {_log_uid} (*@{_log_uname}*)"
     )
 
     try:
-        await bot.send_document(
+        await _notify.send_document(
             user_id, aiogram_types.InputFile(log_path),
             caption=caption_user, parse_mode="Markdown",
             reply_markup=keyboards.main_menu

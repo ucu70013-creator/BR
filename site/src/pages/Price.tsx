@@ -1,7 +1,7 @@
 import { useLang } from '../App';
 
 const SUPPORT = 'https://t.me/TariSmit';
-const BOT = 'https://t.me/Brrown_V2bot';
+const BOT = 'https://t.me/Brown_V2';
 
 const T = {
   ru: {
@@ -20,7 +20,7 @@ const T = {
       { id: '3d', name: '3 дня', rub: '175', usd: '2', icon: '⚡', feat: ['Все методы', 'Ботнет', 'Web', 'Mail'] },
       { id: '7d', name: '7 дней', rub: '350', usd: '4', icon: '✨', feat: ['Все методы', 'Зеркала (бонус)', 'Мониторинг x3'] },
       { id: '30d', name: '30 дней', rub: '700', usd: '8', icon: '✨', feat: ['Все методы', 'Зеркала (бонус)', 'Мониторинг x3'] },
-      { id: 'forever', name: 'Навсегда', rub: '500', usd: '6', icon: '🛡️', popular: true, discount: '-70%', feat: ['Все методы', 'Навсегда', 'Все обновления'] },
+      { id: 'forever', name: 'Навсегда', rub: '500', usd: '6', icon: '∞', popular: true, discount: '-70%', feat: ['Все методы', 'Навсегда', 'Все обновления'] },
       { id: 'premium', name: 'Премиум', rub: '400', usd: '5', icon: '👑', discount: '-50%', feat: ['Премиум-аккаунты', 'Мониторинг x5 (24ч)', 'Приоритет'] },
     ],
   },
@@ -40,7 +40,7 @@ const T = {
       { id: '3d', name: '3 days', rub: '175', usd: '2', icon: '⚡', feat: ['All methods', 'Botnet', 'Web', 'Mail'] },
       { id: '7d', name: '7 days', rub: '350', usd: '4', icon: '✨', feat: ['All methods', 'Mirrors (bonus)', 'Monitoring x3'] },
       { id: '30d', name: '30 days', rub: '700', usd: '8', icon: '✨', feat: ['All methods', 'Mirrors (bonus)', 'Monitoring x3'] },
-      { id: 'forever', name: 'Forever', rub: '500', usd: '6', icon: '🛡️', popular: true, discount: '-70%', feat: ['All methods', 'Lifetime access', 'All updates'] },
+      { id: 'forever', name: 'Forever', rub: '500', usd: '6', icon: '∞', popular: true, discount: '-70%', feat: ['All methods', 'Lifetime access', 'All updates'] },
       { id: 'premium', name: 'Premium', rub: '400', usd: '5', icon: '👑', discount: '-50%', feat: ['Premium accounts', 'Monitoring x5 (24h)', 'Priority'] },
     ],
   },
@@ -79,13 +79,6 @@ export default function Price() {
         ))}
       </div>
 
-      <div className="price-footer">
-        <p className="prem-note">{t.premNote}</p>
-        <div className="card-pay">
-          <span>{t.buyCard}</span>
-          <a href={SUPPORT} target="_blank" rel="noreferrer">{t.cardNote}@TariSmit</a>
-        </div>
-      </div>
     </div>
   );
 }

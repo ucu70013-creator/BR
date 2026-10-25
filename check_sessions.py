@@ -14,6 +14,8 @@ import sys
 try:
     from telethon import TelegramClient
     from telethon.errors import AuthKeyUnregisteredError, UserDeactivatedError, UserDeactivatedBanError
+    from telethon.tl.functions.messages import ReportRequest
+    from telethon.tl.types import InputPeerChannel
 except ImportError:
     print("pip install telethon")
     sys.exit(1)
@@ -62,13 +64,24 @@ async def check_session(session_path: str, folder: str, filename: str) -> tuple:
             me = await asyncio.wait_for(client.get_me(), timeout=TIMEOUT)
             if me:
                 name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-                username = f"@{me.username}" if me.username else "нет юзера"
+                username = f"*@{me.username}*" if me.username else "нет юзера"
                 phone = me.phone or "?"
                 info = f"{name} | {username} | +{phone}"
             else:
                 info = "нет данных"
         except Exception:
             info = "авторизован (инфо недоступно)"
+
+        # Проверяем заморозку через фиктивный ReportRequest
+        try:
+            dummy = InputPeerChannel(channel_id=1, access_hash=0)
+            await client(ReportRequest(peer=dummy, id=[], option=b'', message=''))
+        except Exception as e:
+            ename = type(e).__name__
+            if "Frozen" in ename:
+                await client.disconnect()
+                return "frozen", f"заморожен ({ename})"
+            # ChannelInvalid/PeerIdInvalid — аккаунт рабочий, метод доступен
 
         await client.disconnect()
         return "ok", info
@@ -131,6 +144,9 @@ async def main():
     checked = list(checked)
 
     ok_count = 0
+    invalid_count = 0
+    frozen_count = 0
+    error_count = 0
     bad_list = []
 
     # Извлекаем числовой ID из имени файла для сортировки
@@ -161,14 +177,23 @@ async def main():
             num  = parts[2] if len(parts) > 2 else "-"
         elif status == "invalid":
             icon = "❌"
+            invalid_count += 1
             bad_list.append((path, folder, filename, status, info))
             nick, uz, num = "не авторизован", "-", "-"
         elif status == "banned":
             icon = "🚫"
+            invalid_count += 1
             bad_list.append((path, folder, filename, status, info))
             nick, uz, num = "забанен/удалён", "-", "-"
+        elif status == "frozen":
+            icon = "🧊"
+            frozen_count += 1
+            invalid_count += 1
+            bad_list.append((path, folder, filename, status, info))
+            nick, uz, num = "заморожен", "-", "-"
         else:
             icon = "⚠️ "
+            error_count += 1
             bad_list.append((path, folder, filename, status, info))
             nick, uz, num = info[:30], "-", "-"
 
@@ -178,7 +203,9 @@ async def main():
     print("-" * 130)
     print(f"\n{'='*60}")
     print(f"✅ Валидных   : {ok_count}")
-    print(f"❌ Невалидных : {len(bad_list)}")
+    print(f"❌ Невалидных : {invalid_count - frozen_count}")
+    print(f"🧊 Заморожен  : {frozen_count}")
+    print(f"⚠️  Ошибок     : {error_count}")
     print(f"📦 Всего      : {total}\n")
 
     if not bad_list:
@@ -186,17 +213,31 @@ async def main():
         return
 
     # Спрашиваем об удалении
-    print(f"\nНевалидных сессий: {len(bad_list)}")
-    print("Удалить все невалидные? (y/n/s - выбрать конкретные): ", end="", flush=True)
+    print(f"\nНевалидных сессий: {invalid_count} (+ {error_count} ошибок соединения)")
+    print("Удалить все невалидные? (y/n/s - выбрать конкретные)\n  y = только invalid/banned, e = + ошибки/таймауты, s = выбрать вручную: ", end="", flush=True)
     choice = input().strip().lower()
 
     if choice == "y":
         deleted = 0
         for path, folder, filename, status, info in bad_list:
-            # Таймаут и ошибки НЕ удаляем автоматически — только явно невалидные
             if status == "error":
-                print(f"  ⏭  Пропускаю (таймаут/ошибка): {folder}/{filename}")
                 continue
+            session_file = path + ".session"
+            journal_file = path + ".session-journal"
+            try:
+                if os.path.exists(session_file):
+                    os.remove(session_file)
+                    deleted += 1
+                if os.path.exists(journal_file):
+                    os.remove(journal_file)
+                print(f"  🗑 Удалено: {folder}/{filename} ({status}: {info})")
+            except Exception as e:
+                print(f"  ⚠️  Ошибка удаления {filename}: {e}")
+        print(f"\nУдалено сессий: {deleted}")
+
+    elif choice == "e":
+        deleted = 0
+        for path, folder, filename, status, info in bad_list:
             session_file = path + ".session"
             journal_file = path + ".session-journal"
             try:

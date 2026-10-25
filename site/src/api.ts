@@ -31,6 +31,32 @@ export interface Stats {
   users: number;
 }
 
+export interface UserReport {
+  target_url: string;
+  method: string;
+  success_count: number;
+  created_at: string;
+}
+
+export interface UserProfile {
+  user_id: number;
+  username: string;
+  subscribe: string | null;
+  premium: number;
+  verified: number;
+  free_reports: number;
+  referral_count: number;
+  referrer_id: number | null;
+  referrer_username: string | null;
+  lang: string;
+  is_hidden: boolean;
+  manual_confirmed: number;
+  wheel_last_spin: string | null;
+  wheel_prize: string;
+  invoices_count: number;
+  last_reports: UserReport[];
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(BASE + path);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -69,5 +95,7 @@ export const api = {
     createPromo: (data: Partial<Promo>, t: string) => adminReq('POST', '/admin/promos', data, t),
     updatePromo: (id: number, data: Partial<Promo>, t: string) => adminReq('PUT', `/admin/promos/${id}`, data, t),
     deletePromo: (id: number, t: string) => adminReq('DELETE', `/admin/promos/${id}`, undefined, t),
+    // user lookup
+    lookupUser: (uid: string, t: string) => adminReq('GET', `/admin/user/${uid}`, undefined, t) as Promise<UserProfile>,
   },
 };

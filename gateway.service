@@ -1,0 +1,21 @@
+[Unit]
+Description=Brown V2 Gateway Bots
+After=network.target brv2.service
+Requires=brv2.service
+
+[Service]
+WorkingDirectory=/root/BR
+ExecStart=/usr/bin/python3 gateway_bot.py
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+Environment=DATABASE_URL=postgresql://botuser:botpass123@localhost/botdb
+Environment=GATEWAY_TOKEN_1=8810770638:AAFS7Wb_05VdGdfr5mrwZC3YJTly4Ltouk8
+Environment=GATEWAY_TOKEN_2=8853831300:AAFKf_qBvW7qDFqa8Lz0Feqtivf-WYhTozA
+Environment=GATEWAY_TOKEN_3=8895329409:AAGsp_XtwKJEhL70xaxL0tvIG4A9_RY89x0
+
+[Install]
+WantedBy=multi-user.target

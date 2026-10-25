@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, Mirror, Review, Promo } from '../api';
+import { api, Mirror, Review, Promo, UserProfile } from '../api';
 
-type Tab = 'mirrors' | 'reviews' | 'promos';
+type Tab = 'mirrors' | 'reviews' | 'promos' | 'user';
 type Phase = 'login' | 'pending' | 'authed';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'mirrors', label: '🪞 Зеркала' },
   { id: 'reviews', label: '💬 Отзывы' },
   { id: 'promos', label: '🎁 Промокоды' },
+  { id: 'user', label: '👤 Пользователь' },
 ];
 
 function usePersistedAuth() {
@@ -258,6 +259,160 @@ function PromosTab({ token }: { token: string }) {
   );
 }
 
+// ── User lookup tab ────────────────────────────────────────────────────────────
+function UserTab({ token }: { token: string }) {
+  const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [err, setErr] = useState('');
+
+  const search = async () => {
+    const uid = query.trim();
+    if (!uid || !/^\d+$/.test(uid)) { setErr('Введите числовой ID'); return; }
+    setErr(''); setUser(null); setLoading(true);
+    try {
+      const data = await api.admin.lookupUser(uid, token);
+      setUser(data);
+    } catch (e: any) {
+      setErr(e.message === 'HTTP 404' ? 'Пользователь не найден' : e.message || 'Ошибка');
+    } finally { setLoading(false); }
+  };
+
+  const fmtDate = (iso: string | null) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (d.getFullYear() < 2000) return 'нет';
+    return d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  };
+
+  const subActive = (iso: string | null) => {
+    if (!iso) return false;
+    return new Date(iso) > new Date();
+  };
+
+  return (
+    <div className="adm-tab">
+      <div className="adm-form">
+        <h3>Проверить пользователя</h3>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            placeholder="Telegram ID (числовой)"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && search()}
+            style={{ flex: 1 }}
+          />
+          <button className="btn-primary sm" onClick={search} disabled={loading}>
+            {loading ? '…' : 'Найти'}
+          </button>
+        </div>
+        {err && <p className="err-msg">{err}</p>}
+      </div>
+
+      {user && (
+        <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {/* Profile card */}
+          <div style={{
+            background: 'var(--card-bg)',
+            border: '1px solid var(--border)',
+            borderRadius: 12,
+            padding: '16px 20px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 8 }}>
+              <div>
+                <div style={{ fontSize: '1.1rem', fontWeight: 700 }}>
+                  {user.username ? `@${user.username}` : `ID ${user.user_id}`}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: 'var(--text2)', marginTop: 2 }}>
+                  ID: <code style={{ fontSize: '0.8rem' }}>{user.user_id}</code>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {user.premium ? <span className="status-badge active">⭐ Premium</span> : null}
+                {user.verified ? <span className="status-badge active">✅ Верифицирован</span> : null}
+                {user.manual_confirmed ? <span className="status-badge active">🤝 Ручное</span> : null}
+                {user.is_hidden ? <span className="status-badge off">👁 Скрыт</span> : null}
+              </div>
+            </div>
+
+            <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '4px 0' }} />
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px', fontSize: '0.85rem' }}>
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Подписка: </span>
+                <span style={{ color: subActive(user.subscribe) ? 'var(--accent2)' : 'var(--text2)', fontWeight: subActive(user.subscribe) ? 700 : 400 }}>
+                  {subActive(user.subscribe) ? `до ${fmtDate(user.subscribe)}` : `истекла ${fmtDate(user.subscribe)}`}
+                </span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Язык: </span>
+                <span>{user.lang?.toUpperCase() || 'RU'}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Бесплатных репортов: </span>
+                <span style={{ fontWeight: 700 }}>{user.free_reports}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Оплат: </span>
+                <span style={{ fontWeight: 700 }}>{user.invoices_count}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Рефералов: </span>
+                <span style={{ fontWeight: 700 }}>{user.referral_count}</span>
+              </div>
+              {user.referrer_id && (
+                <div>
+                  <span style={{ color: 'var(--text2)' }}>Приглашён: </span>
+                  <span>
+                    {user.referrer_username ? `@${user.referrer_username}` : ''} <code style={{ fontSize: '0.78rem' }}>{user.referrer_id}</code>
+                  </span>
+                </div>
+              )}
+              <div>
+                <span style={{ color: 'var(--text2)' }}>Колесо: </span>
+                <span>{fmtDate(user.wheel_last_spin)}{user.wheel_prize ? ` (${user.wheel_prize})` : ''}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Last 3 reports */}
+          <div>
+            <div style={{ fontSize: '0.85rem', color: 'var(--text2)', fontWeight: 600, marginBottom: 8 }}>
+              Последние репорты ({user.last_reports.length})
+            </div>
+            {user.last_reports.length === 0 ? (
+              <p className="empty-note" style={{ marginTop: 0 }}>Репортов нет</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {user.last_reports.map((r, i) => (
+                  <div key={i} style={{
+                    background: 'var(--card-bg)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 8,
+                    padding: '10px 14px',
+                    fontSize: '0.82rem',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
+                      <span style={{ fontWeight: 600, wordBreak: 'break-all' }}>{r.target_url}</span>
+                      <span style={{ color: 'var(--text2)', whiteSpace: 'nowrap' }}>{fmtDate(r.created_at)}</span>
+                    </div>
+                    <div style={{ marginTop: 4, color: 'var(--text2)' }}>
+                      Метод: <strong>{r.method}</strong> · Успешно: <strong>{r.success_count}</strong>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Pending screen ─────────────────────────────────────────────────────────────
 function PendingScreen({ onCancel }: { onCancel: () => void }) {
   return (
@@ -437,6 +592,7 @@ export default function Admin() {
         {tab === 'mirrors' && <MirrorsTab token={token} />}
         {tab === 'reviews' && <ReviewsTab token={token} />}
         {tab === 'promos' && <PromosTab token={token} />}
+        {tab === 'user' && <UserTab token={token} />}
       </div>
     );
   }

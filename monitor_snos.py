@@ -207,8 +207,9 @@ async def check_target(target: str, session_path: str) -> dict:
                 await client.disconnect()
                 return {"alive": False, "reason": "Аккаунт удалён / заморожен", "status": "dead"}
             except ChannelPrivateError:
+                # Канал приватный или у сессии нет доступа — не значит что удалён
                 await client.disconnect()
-                return {"alive": False, "reason": "Канал/чат стал приватным или удалён", "status": "dead"}
+                return {"alive": True, "reason": "", "status": "error"}
             except RPCError as e:
                 err = str(e).lower()
                 if "deactivated" in err or "deleted" in err or "banned" in err:
@@ -245,9 +246,14 @@ async def check_target(target: str, session_path: str) -> dict:
                     if msg is None:
                         await client.disconnect()
                         return {"alive": False, "reason": "Сообщение удалено", "status": "msg_deleted"}
-                except Exception:
+                except FloodWaitError as e:
                     await client.disconnect()
-                    return {"alive": False, "reason": "Не удалось получить сообщение", "status": "msg_deleted"}
+                    logger.warning(f"[MONITOR] FloodWait {e.seconds}s при получении сообщения {target}")
+                    return {"alive": True, "reason": "", "status": "error"}
+                except Exception as e:
+                    await client.disconnect()
+                    logger.warning(f"[MONITOR] Ошибка get_messages {target}: {e}")
+                    return {"alive": True, "reason": "", "status": "error"}
                 await client.disconnect()
                 return {"alive": True, "reason": "", "status": "alive"}
 
@@ -344,6 +350,7 @@ async def _check_one(monitor: dict):
             _release_session(session_path, monitor_id)
 
         if result["status"] == "error":
+            # Ошибка сети/сессии — не считаем за страйк, игнорируем
             return
 
         new_alive = result["alive"]
@@ -352,11 +359,33 @@ async def _check_one(monitor: dict):
         await db.update_monitor_check(monitor_id, new_status)
 
         if new_status == "dead" and not monitor.get("notified"):
-            await db.mark_monitor_notified(monitor_id)
-            await _notify_user(user_id, target, result["reason"], result["status"])
-            await db.deactivate_monitor(monitor_id)
-        elif new_status == "alive" and not monitor.get("notify_silent"):
-            await _notify_user_alive(user_id, target, monitor_id)
+            strikes = await db.increment_monitor_dead_strikes(monitor_id)
+            if strikes >= 2:
+                # Два подряд dead — теперь уведомляем
+                await db.mark_monitor_notified(monitor_id)
+                await _notify_user(user_id, target, result["reason"], result["status"])
+                await db.deactivate_monitor(monitor_id)
+            else:
+                logger.info(f"[MONITOR] {target} — dead strike {strikes}/2, ждём подтверждения")
+        elif new_status == "alive":
+            await db.reset_monitor_dead_strikes(monitor_id)
+            if not monitor.get("notify_silent"):
+                await _notify_user_alive(user_id, target, monitor_id)
+
+
+async def _get_user_bot(user_id: int):
+    """Возвращает бот юзера: его зеркало → любое живое зеркало → основной бот."""
+    try:
+        import db as _db
+        from mirror_manager import _mirror_bots
+        token = await _db.get_user_mirror(user_id)
+        if token and token in _mirror_bots:
+            return _mirror_bots[token]
+        if _mirror_bots:
+            return next(iter(_mirror_bots.values()))
+    except Exception:
+        pass
+    return _bot
 
 
 async def _notify_user_alive(user_id: int, target: str, monitor_id: int):
@@ -368,12 +397,13 @@ async def _notify_user_alive(user_id: int, target: str, monitor_id: int):
     markup.add(tg_types.InlineKeyboardButton(
         "🔕 Отключить до сноса", callback_data=f'monitor_mute_{monitor_id}'
     ))
+    send_bot = await _get_user_bot(user_id)
     try:
-        await _bot.send_message(
+        await send_bot.send_message(
             user_id,
             f"🔍 *Мониторинг BR V2*\n\n"
             f"🟢 *Цель жива*\n\n"
-            f"🎯 *Цель:* `{target}`\n"
+            f"🎯 *Цель:* {target}\n"
             f"🕐 *Следующая проверка через 10 минут*",
             parse_mode="Markdown",
             reply_markup=markup
@@ -395,12 +425,13 @@ async def _notify_user(user_id: int, target: str, reason: str, status: str):
     target_escaped = target.replace('_', '\\_').replace('.', '\\.')
     reason_text = f"\n*└─ Причина:* {reason}" if reason else ""
 
+    send_bot = await _get_user_bot(user_id)
     try:
-        await _bot.send_message(
+        await send_bot.send_message(
             user_id,
             f"🔍 *Мониторинг BR V2*\n\n"
             f"{status_emoji}\n\n"
-            f"🎯 *Цель:* `{target}`"
+            f"🎯 *Цель:* {target}"
             f"{reason_text}\n\n"
             f"🕐 *Время:* {now_msk().strftime('%d.%m.%Y %H:%M:%S')}",
             parse_mode="Markdown"
@@ -411,9 +442,12 @@ async def _notify_user(user_id: int, target: str, reason: str, status: str):
     # Лог
     try:
         if _bot_logs:
+            import db as _db_mod
+            _is_hid = await _db_mod.get_is_hidden(user_id)
+            _log_uid = "скрыт" if _is_hid else str(user_id)
             await _bot.send_message(
                 _bot_logs,
-                f"🔍 *Монитор:* `{user_id}` — цель `{target}` снесена",
+                f"🔍 *Монитор:* {_log_uid} — цель {target} снесена",
                 parse_mode="Markdown"
             )
     except Exception:
@@ -517,9 +551,12 @@ async def _notify_telegraph(user_id: int, url: str):
 
     try:
         if _bot_logs:
+            import db as _db_mod
+            _is_hid = await _db_mod.get_is_hidden(user_id)
+            _log_uid = "скрыт" if _is_hid else str(user_id)
             await _bot.send_message(
                 _bot_logs,
-                f"📄 *Telegraph удалена:* {url}\n👤 {user_id}",
+                f"📄 *Telegraph удалена:* {url}\n👤 {_log_uid}",
                 parse_mode="Markdown",
                 disable_web_page_preview=True
             )

@@ -14,11 +14,13 @@ import logging
 from telethon import TelegramClient
 from telethon.tl.functions.messages import ReportRequest
 from telethon.errors import FloodWaitError, UsernameNotOccupiedError, UsernameInvalidError
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+from telethon.tl.types import InputPeerUser
 from aiogram import types
 import config
 from config import bot_logs
 import keyboards
-from utils import now_msk
+from utils import now_msk, esc_md
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,22 @@ def format_log_line(session, target, status):
     return f'[{now}] {os.path.basename(session)}.session -> {target} - [{status}]'
 
 
+def _archive_invalid_session(session_path: str):
+    """Перемещает невалидную сессию в папку invalid_sessions/"""
+    try:
+        invalid_dir = 'invalid_sessions'
+        os.makedirs(invalid_dir, exist_ok=True)
+        basename = os.path.basename(session_path)
+        for ext in ('.session', '.session-journal'):
+            src = session_path + ext
+            if os.path.exists(src):
+                dst = os.path.join(invalid_dir, basename + ext)
+                os.rename(src, dst)
+        print(f'[PROFILE] Сессия {basename} перемещена в invalid_sessions/', flush=True)
+    except Exception as e:
+        print(f'[PROFILE] Ошибка архивации сессии: {e}', flush=True)
+
+
 async def _find_option(client, peer, keyword_ru: str, keyword_en: str, prev_option: bytes = b'') -> bytes | None:
     """
     Делает шаг ReportRequest с prev_option и ищет в результате
@@ -109,8 +127,13 @@ async def _scout_options(target_username: str) -> tuple[bytes | None, bytes | No
             await client.disconnect()
             return None, None
 
-        entity = await client.get_entity(target_username)
-        peer = await client.get_input_entity(entity)
+        uname = target_username.lstrip('@')
+        resolved = await client(ResolveUsernameRequest(uname))
+        if not resolved.users:
+            await client.disconnect()
+            return None, None
+        u = resolved.users[0]
+        peer = InputPeerUser(u.id, u.access_hash)
 
         # Шаг 1: ищем "Другое" / "Other"
         other_opt = await _find_option(client, peer, 'другое', 'other', b'')
@@ -149,18 +172,34 @@ async def _report_session(session_path: str, target_username: str,
     client = TelegramClient(session_path, int(api_id), api_hash,
                             system_version='4.16.30-vxCUSTOM')
     try:
-        try:
-            await asyncio.wait_for(client.connect(), timeout=8)
-        except asyncio.TimeoutError:
-            return 'TIMEOUT'
+        # Retry connect up to 2 times
+        connected = False
+        for _attempt in range(2):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=12)
+                connected = True
+                break
+            except (asyncio.TimeoutError, OSError, ConnectionError):
+                if _attempt == 1:
+                    return 'ОШИБКА СОЕДИНЕНИЯ'
+                await asyncio.sleep(1)
+        if not connected:
+            return 'ОШИБКА СОЕДИНЕНИЯ'
 
         if not await client.is_user_authorized():
             await client.disconnect()
+            _archive_invalid_session(session_path)
             return 'НЕВАЛИД'
 
+        # Resolve entity via ResolveUsernameRequest to always get access_hash
         try:
-            entity = await client.get_entity(target_username)
-            peer = await client.get_input_entity(entity)
+            uname = target_username.lstrip('@')
+            resolved = await client(ResolveUsernameRequest(uname))
+            if not resolved.users:
+                await client.disconnect()
+                return 'НЕ НАЙДЕН'
+            u = resolved.users[0]
+            peer = InputPeerUser(u.id, u.access_hash)
         except (UsernameNotOccupiedError, UsernameInvalidError):
             await client.disconnect()
             return 'НЕ НАЙДЕН'
@@ -227,7 +266,7 @@ async def _report_session(session_path: str, target_username: str,
             pass
 
 
-async def main_profile_snos(target_link: str, user: int, username: str):
+async def main_profile_snos(target_link: str, user: int, username: str, notify_bot=None):
     """Главная функция — жалоба на профиль от всех сессий."""
 
     # Нормализуем target
@@ -241,9 +280,10 @@ async def main_profile_snos(target_link: str, user: int, username: str):
     else:
         target = raw.split('/')[0].split('?')[0]
 
+    _notify = notify_bot or bot
     sessions = _get_sessions()
     if not sessions:
-        await bot.send_message(
+        await _notify.send_message(
             user, '❌ *Нет сессий!*',
             parse_mode='Markdown', reply_markup=keyboards.main_menu
         )
@@ -251,11 +291,11 @@ async def main_profile_snos(target_link: str, user: int, username: str):
 
     total = len(sessions)
 
-    await bot.send_message(
+    await _notify.send_message(
         user,
         f'👤 *\[ТЕСТ\] Profile Report*\n'
-        f'*└─ Цель:* `@{target}`\n'
-        f'*└─ Сессий:* `{total}`\n'
+        f'*└─ Цель:* *@{target}*\n'
+        f'*└─ Сессий:* {total}\n'
         f'*└─ Маршрут:* Другое → Прочее → текст\n\n'
         f'⏳ *Определяю категории...*',
         parse_mode='Markdown'
@@ -273,7 +313,7 @@ async def main_profile_snos(target_link: str, user: int, username: str):
         )
         return
 
-    print(f'[PROFILE] 🚀 Старт | @{target} | сессий={total} | other={other_opt} | misc={misc_opt}', flush=True)
+    print(f'[PROFILE] 🚀 Старт | *@{target}* | сессий={total} | other={other_opt} | misc={misc_opt}', flush=True)
 
     # Запускаем пачками по 3 (по одному репорту с трёх аккаунтов → пауза)
     BATCH_SIZE = 3
@@ -298,8 +338,8 @@ async def main_profile_snos(target_link: str, user: int, username: str):
     log_lines = [
         'Brown V2 log | profile-method [ТЕСТ]',
         '-' * 42,
-        f'Пользователь: {user} (@{username})',
-        f'Цель: @{target}',
+        f'Пользователь: {user} (*@{username}*)',
+        f'Цель: *@{target}*',
         f'Маршрут: Другое -> Прочее -> текст',
         f'Время: {now_str}',
         '-' * 42,
@@ -319,16 +359,24 @@ async def main_profile_snos(target_link: str, user: int, username: str):
     target_esc = target.replace('_', '\\_')
     caption_user = (
         f'👤 *\[ТЕСТ\] Profile Report завершён!*\n\n'
-        f'🎯 *Цель:* @{target_esc}\n'
+        f'🎯 *Цель:* *@{target_esc}*\n'
         f'📋 *Маршрут:* Другое → Прочее → текст\n'
         f'🕐 *Время:* {now_str}\n\n'
         f'🟢 *Успешно: {delivered}*\n'
         f'🔴 *Не удалось: {failed}*'
     )
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user)
+        _log_uid = "скрыт" if _is_hid else str(user)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user), username
+
     caption_log = (
         f'👤 *\[ТЕСТ\] Profile-method*\n\n'
-        f'🎯 *Цель:* @{target_esc}\n'
-        f'👤 *Пользователь:* `{user}` (@{username})\n'
+        f'🎯 *Цель:* *@{target_esc}*\n'
+        f'👤 *Пользователь:* {_log_uid} (*@{_log_uname}*)\n'
         f'🕐 *Время:* {now_str}\n\n'
         f'🟢 *Успешно: {delivered}*\n'
         f'🔴 *Не удалось: {failed}*'

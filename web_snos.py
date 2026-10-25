@@ -4,7 +4,7 @@ import aiohttp
 import os
 import string
 import aiofiles
-from utils import now_msk
+from utils import now_msk, esc_md
 
 codes = ["495", "499", "812", "900", "901", "902", "903", "904", "905", "906", "908", "909", "910", "911", "912", "913", "914", "915", "916", "917", "918", "919", "920", "921", "922", "923", "924", "925", "926", "927", "928", "929", "930", "931", "932", "933", "934", "936", "937", "938", "939", "941", "950", "951", "952", "953", "954", "955", "958", "960", "961"]
 names = ["ilya", "dima", "ivan", "alexey", "sergey", "mikhail", "andrey", "pavel", "nikolay", "vladimir", "anatoly", "boris", "egor", "danil", "viktor", "yuri", "maksim", "grigory", "oleg", "timofey", "arseniy", "roman", "konstantin", "gennady", "artem", "vadim", "vitaly", "nikita", "stanislav", "alexander", "vasily", "leonid", "valery", "eduard", "denis", "kirill", "fedor", "petya", "yegor", "german", "stepan", "platon", "bogdan", "ignat", "arkady", "yaroslav", "matvey", "rostan", "vsevolod", "semyon", "anton", "zahar", "timur", "roksana", "daniil", "afanasiy", "innokentiy", "rodion", "valentin", "nikifor", "petr", "filipp", "martin", "adrian", "georgy", "vladislav", "arseny", "artur", "mark", "prokhor", "lavrenty", "anastasiya", "olga", "anna", "ekaterina", "maria", "tatiana", "sofia", "elena", "natalia", "svetlana", "valentina", "lyubov", "galina", "lidiya", "nina", "darya", "alisa", "veronika", "irina", "arina", "kristina", "oksana", "polina", "viktoriya", "karina", "milana", "zinaida", "angelina", "yulia", "zoya", "ksenia"]
@@ -22,7 +22,7 @@ def generatemail():
     last_name = random.choice(last_names)
     year = random.choice(years)
     domain = random.choice(domains)
-    return f"{name}.{last_name}.{year}@{domain}"
+    return f"{name}.{last_name}.{year}@{esc_md(domain)}"
 
 LOGS_DIR = "logs"
 
@@ -76,7 +76,7 @@ async def web(session, message_text, count, log_path=None, user_id=None, usernam
 
     print(f"\n{'='*50}", flush=True)
     print(f"[WEB] 🚀 Запуск веб-жалоб", flush=True)
-    print(f"[WEB] 👤 Пользователь: {user_id} (@{username})", flush=True)
+    print(f"[WEB] 👤 Пользователь: {user_id} (*@{username}*)", flush=True)
     print(f"[WEB] 📝 Текст: {message_text[:80]}{'...' if len(message_text) > 80 else ''}", flush=True)
     print(f"[WEB] 📊 Количество жалоб: {count}", flush=True)
     print(f"{'='*50}", flush=True)
@@ -104,7 +104,7 @@ async def web(session, message_text, count, log_path=None, user_id=None, usernam
         header = (
             "Brown V2 log | web-method\n"
             "------------------------------------------\n"
-            f"Пользователь: {user_id} (@{username if username else 'без username'})\n"
+            f"Пользователь: {user_id} (*@{username if username else 'без username'}*)\n"
             f"Текст: {message_text}\n"
             "------------------------------------------\n"
         )

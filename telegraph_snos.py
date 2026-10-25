@@ -19,7 +19,7 @@ from pathlib import Path
 import aiohttp
 
 import config
-from utils import now_msk
+from utils import now_msk, esc_md
 from mail_snos import spin_text, spin_subject
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,9 @@ async def fetch_telegraph_text(url: str) -> tuple[str, int]:
 
         api_url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
 
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector()
+        session = aiohttp.ClientSession(connector=connector)
+        try:
             async with session.get(
                 api_url,
                 timeout=aiohttp.ClientTimeout(total=10),
@@ -106,6 +108,9 @@ async def fetch_telegraph_text(url: str) -> tuple[str, int]:
                 if resp.status != 200:
                     return "", resp.status
                 data = await resp.json(content_type=None)
+        finally:
+            await session.close()
+            await connector.close()
 
         if not data.get("ok"):
             return "", 404
@@ -137,6 +142,7 @@ async def fetch_telegraph_text(url: str) -> tuple[str, int]:
 
 # ─── Groq генерация ───────────────────────────────────────────────────────────
 async def generate_telegraph_text(article_url: str, article_text: str) -> tuple[str, str]:
+    print(f"[TELEGRAPH] generate_telegraph_text START", flush=True)
     fallback_subject = f"ToS Violation Report"
     fallback_body = (
         f"Dear Telegram Support,\n\n"
@@ -162,46 +168,62 @@ async def generate_telegraph_text(article_url: str, article_text: str) -> tuple[
         f"No labels, no formatting, just the text."
     )
 
+    connector = aiohttp.TCPConnector()
+    session = aiohttp.ClientSession(connector=connector)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-                    "messages": [
-                        {"role": "system", "content": "You generate formal complaint emails. Be concise and professional."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "max_tokens": 300,
-                    "temperature": 0.7,
-                },
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                data = await resp.json(content_type=None)
-                if "choices" not in data:
-                    return fallback_subject, fallback_body
+        async with session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "openai/gpt-oss-20b",
+                "messages": [
+                    {"role": "system", "content": "You generate formal complaint emails. Be concise and professional."},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 300,
+                "temperature": 0.7,
+                "reasoning_effort": "low",
+            },
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if "choices" not in data:
+                print(f"[TELEGRAPH] Groq no choices: {str(data)[:400]}", flush=True)
+                return fallback_subject, fallback_body
 
-                content = data["choices"][0]["message"]["content"].strip()
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+            # openai/gpt-oss-20b puts output in `reasoning` when content is empty
+            if not content:
+                content = (msg.get("reasoning") or "").strip()
+                print(f"[TELEGRAPH] Groq using reasoning field: {content[:100]}", flush=True)
+            else:
                 print(f"[TELEGRAPH] Groq raw: {content[:200]}", flush=True)
 
-                lines = content.strip().split("\n")
-                subject = lines[0].strip()[:100] if lines else fallback_subject
-                body = "\n".join(lines[1:]).strip()[:600] if len(lines) > 1 else fallback_body
+            if not content:
+                print(f"[TELEGRAPH] Groq both empty, data: {str(data)[:300]}", flush=True)
+                return fallback_subject, fallback_body
 
-                if not subject:
-                    subject = fallback_subject
-                if not body:
-                    body = fallback_body
+            lines = content.strip().split("\n")
+            subject = lines[0].strip()[:100] if lines else fallback_subject
+            body = "\n".join(lines[1:]).strip()[:600] if len(lines) > 1 else fallback_body
 
-                return subject, body
+            if not subject:
+                subject = fallback_subject
+            if not body:
+                body = fallback_body
+
+            return subject, body
 
     except Exception as e:
-        logger.error(f"[TELEGRAPH] Groq error: {e}")
+        print(f"[TELEGRAPH] Groq error: {e}", flush=True)
         return fallback_subject, fallback_body
+    finally:
+        await session.close()
+        await connector.close()
 
 
 # ─── Отправка одного письма через relay ───────────────────────────────────────
@@ -239,12 +261,13 @@ async def main_telegraph_snos(
     username: str,
     custom_text: str = "",
     custom_subject: str = "",
+    notify_bot=None,
 ) -> dict:
     from config import bot_logs
     import keyboards
     from aiogram import types as aiogram_types
 
-    print(f"\n[TELEGRAPH] 🚀 Старт | {article_url} | {user_id} (@{username})", flush=True)
+    print(f"\n[TELEGRAPH] 🚀 Старт | {article_url} | {user_id} (*@{username}*)", flush=True)
 
     if custom_text and custom_subject:
         subject = custom_subject
@@ -306,26 +329,35 @@ async def main_telegraph_snos(
     caption = (
         f"📄 *Telegraph снос завершён!*\n"
         f"*└─* [Статья]({article_url})\n\n"
-        f"📨 *Жалоб отправлено:* `{ok}/{total}`\n"
-        f"✅ *Успешно:* `{ok}`\n"
-        f"❌ *Ошибок:* `{fail}`"
+        f"📨 *Жалоб отправлено:* {ok}/{total}\n"
+        f"✅ *Успешно:* {ok}\n"
+        f"❌ *Ошибок:* {fail}"
     )
+
+    try:
+        import db as _db_mod
+        _is_hid = await _db_mod.get_is_hidden(user_id)
+        _log_uid = "скрыт" if _is_hid else str(user_id)
+        _log_uname = "скрыт" if _is_hid else username
+    except Exception:
+        _log_uid, _log_uname = str(user_id), username
 
     caption_log = (
         f"📄 *Telegraph*\n"
         f"*└─* [Статья]({article_url})\n"
         f"✅ {ok} | ❌ {fail}\n"
-        f"👤 {user_id} (@{username})"
+        f"👤 {_log_uid} (*@{_log_uname}*)"
     )
 
+    _notify = notify_bot or bot
     try:
-        await bot.send_message(
+        await _notify.send_message(
             user_id, caption,
             parse_mode="Markdown",
             reply_markup=keyboards.main_menu,
             disable_web_page_preview=True
         )
-        await bot.send_message(
+        await (bot or _notify).send_message(
             bot_logs, caption_log,
             parse_mode="Markdown",
             disable_web_page_preview=True
